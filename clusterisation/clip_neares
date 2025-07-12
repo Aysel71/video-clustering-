@@ -1,0 +1,867 @@
+#!/usr/bin/env python3
+"""
+=====================================
+1. Берем кадры из облака (processed_frames)
+2. Получаем для них CLIP эмбеддинги заново
+3. Получаем CLIP эмбеддинг вопроса
+4. Ищем N ближайших кадров к вопросу
+5. Отправляем в Qwen с logprobs
+6. Полная оценка на всех видео
+"""
+
+import os
+import json
+import logging
+import boto3
+import torch
+import clip
+import numpy as np
+import requests
+import time
+import re
+from PIL import Image
+from pathlib import Path
+from datetime import datetime
+from sklearn.metrics.pairwise import cosine_distances
+from datasets import load_dataset
+from collections import defaultdict
+from typing import List, Dict, Tuple, Optional
+from tqdm import tqdm
+import threading
+import warnings
+warnings.filterwarnings('ignore')
+
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+def setup_logging():
+    """Настройка логирования"""
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    Path('logs').mkdir(exist_ok=True)
+    log_filename = f"logs/simple_selector_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+logger = setup_logging()
+
+class SimpleFrameSelector:
+    """Простой селектор фреймов: кадры из облака + CLIP + ближайшие к вопросу"""
+    
+    def __init__(self, bucket_name: str = "videoresearch"):
+        self.bucket_name = bucket_name
+        self.max_frames = 8  # Количество кадров для отправки в Qwen
+        
+        # API конфигурация
+        self.FIREWORKS_API_KEY = "key"
+        self.fireworks_url = "https://api.fireworks.ai/inference/v1/chat/completions"
+        self.model_name = "fireworks/qwen2p5-vl-32b-instruct"
+        
+        self.backup_models = [
+            "fireworks/qwen2-vl-7b-instruct",
+            "fireworks/llava-v1p6-34b-instruct"
+        ]
+        
+        # Категории
+        self.categories = [
+            'Action Recognition', 'Action Reasoning', 'Attribute Perception',
+            'Counting Problem', 'OCR Problems', 'Object Recognition',
+            'Spatial Perception', 'Spatial Reasoning', 'Temporal Perception',
+            'Temporal Reasoning'
+        ]
+        
+        self.answer_choices = ['A', 'B', 'C', 'D', 'E']
+        
+        # Кэширование для ускорения
+        self.question_embeddings_cache = {}
+        self.cache_lock = threading.Lock()
+        
+        self._setup_system()
+        
+        # Статистика
+        self.stats = {
+            'start_time': datetime.now(),
+            'videos_processed': 0,
+            'correct_answers': 0,
+            'total_questions': 0,
+            'errors': 0,
+            'frames_processed': 0,
+            'by_category': defaultdict(lambda: {'correct': 0, 'total': 0})
+        }
+    
+    def _setup_system(self):
+        """Настройка системы"""
+        logger.info("ПРОСТОЙ СЕЛЕКТОР ФРЕЙМОВ - ИНИЦИАЛИЗАЦИЯ")
+        
+        self._setup_device()
+        self._setup_cloud_storage()
+        self._load_clip_model()
+        self._load_dataset()
+        self._create_directories()
+        self._scan_available_videos()
+        
+        logger.info("Система готова для простого подхода")
+    
+    def _setup_device(self):
+        """Настройка устройства"""
+        torch.set_default_dtype(torch.float32)
+        
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+            logger.info("Используется Apple Silicon GPU (MPS)")
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+            logger.info("Используется NVIDIA GPU")
+        else:
+            self.device = "cpu"
+            logger.info("Используется CPU")
+    
+    def _setup_cloud_storage(self):
+        """Настройка облачного хранилища"""
+        access_key = os.getenv('YANDEX_ACCESS_KEY') 
+        secret_key = os.getenv('YANDEX_SECRET_KEY')
+        
+        self.s3_client = boto3.client(
+            's3',
+            endpoint_url='https://storage.yandexcloud.net',
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            config=boto3.session.Config(
+                max_pool_connections=20,
+                retries={'max_attempts': 3}
+            )
+        )
+        
+        logger.info("Подключение к Yandex Cloud установлено")
+    
+    def _load_clip_model(self):
+        """Загрузка CLIP модели"""
+        logger.info("Загрузка CLIP модели...")
+        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+        self.clip_model = self.clip_model.float()
+        self.clip_model.eval()
+        logger.info("CLIP модель загружена")
+    
+    def _load_dataset(self):
+        """Загрузка датасета с вопросами"""
+        logger.info("Загрузка датасета...")
+        
+        self.dataset = load_dataset("facebook/PLM-Video-Auto", "yt1b_mcqa", split="train")
+        
+        # Создаем индекс
+        self.dataset_index = {}
+        for sample in self.dataset:
+            if sample['category'] in self.categories:
+                key = (sample['video_id'], sample['category'])
+                self.dataset_index[key] = sample
+        
+        logger.info(f"Загружено {len(self.dataset_index)} вопросов")
+    
+    def _create_directories(self):
+        """Создание директорий"""
+        directories = [
+            'logs', 'simple_results', 'temp_frames_simple'
+        ]
+        for directory in directories:
+            Path(directory).mkdir(exist_ok=True)
+    
+    def _scan_available_videos(self):
+        """Сканирование доступных обработанных видео"""
+        logger.info("Сканирование обработанных видео...")
+        
+        self.available_videos = defaultdict(list)
+        
+        for category in self.categories:
+            try:
+                prefix = f"processed_frames/{category}/"
+                response = self.s3_client.list_objects_v2(
+                    Bucket=self.bucket_name,
+                    Prefix=prefix,
+                    Delimiter='/'
+                )
+                
+                if 'CommonPrefixes' in response:
+                    for obj in response['CommonPrefixes']:
+                        video_id = obj['Prefix'].split('/')[-2]
+                        
+                        # Проверяем, что есть вопрос для этого видео
+                        key = (video_id, category)
+                        if key in self.dataset_index:
+                            self.available_videos[category].append(video_id)
+                
+                logger.info(f"  {category}: {len(self.available_videos[category])} видео")
+                
+            except Exception as e:
+                logger.warning(f"Ошибка сканирования {category}: {e}")
+        
+        total_videos = sum(len(videos) for videos in self.available_videos.values())
+        logger.info(f"Всего доступно {total_videos} обработанных видео")
+    
+    def get_question_embedding_cached(self, question_text: str) -> np.ndarray:
+        """Получение CLIP эмбеддинга вопроса с кэшированием"""
+        question_hash = hash(question_text)
+        
+        with self.cache_lock:
+            if question_hash in self.question_embeddings_cache:
+                return self.question_embeddings_cache[question_hash]
+        
+        try:
+            # Очищаем и обрезаем вопрос для CLIP (максимум 77 токенов)
+            clean_question = re.sub(r'[A-E]\)\s*', '', question_text)
+            clean_question = re.sub(r'\n+', ' ', clean_question)
+            
+            # Берем только основной вопрос до "Options:"
+            question_parts = clean_question.split('Options:')
+            if len(question_parts) > 1:
+                main_question = question_parts[0].strip()
+            else:
+                question_parts = clean_question.split('Answer')
+                main_question = question_parts[0].strip()
+            
+            # Ограничиваем длину
+            words = main_question.split()
+            if len(words) > 12:
+                main_question = ' '.join(words[:12])
+            
+            logger.debug(f"Вопрос для CLIP: {main_question}")
+            
+            # Получаем эмбеддинг
+            with torch.no_grad():
+                text_tokens = clip.tokenize([main_question]).to(self.device)
+                text_features = self.clip_model.encode_text(text_tokens)
+                text_embedding = text_features.float().cpu().numpy().flatten()
+            
+            # Кэшируем
+            with self.cache_lock:
+                self.question_embeddings_cache[question_hash] = text_embedding
+            
+            return text_embedding
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения эмбеддинга вопроса: {e}")
+            return None
+    
+    def load_frames_from_cloud(self, video_id: str, category: str) -> List[Dict]:
+        """Загрузка кадров из облака как изображений"""
+        try:
+            # Получаем список кадров
+            prefix = f"processed_frames/{category}/{video_id}/"
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.bucket_name,
+                Prefix=prefix
+            )
+            
+            if 'Contents' not in response:
+                logger.warning(f"Нет кадров для {video_id}")
+                return []
+            
+            # Фильтруем только jpg файлы (исключаем metadata.json)
+            frame_objects = [
+                obj for obj in response['Contents'] 
+                if obj['Key'].endswith('.jpg')
+            ]
+            
+            if not frame_objects:
+                logger.warning(f"Нет jpg кадров для {video_id}")
+                return []
+            
+            logger.info(f"Найдено {len(frame_objects)} кадров для {video_id}")
+            
+            # Создаем временную папку
+            temp_dir = Path('temp_frames_simple') / video_id
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            
+            frames_data = []
+            
+            # Загружаем и обрабатываем кадры
+            for obj in frame_objects:
+                try:
+                    frame_key = obj['Key']
+                    filename = frame_key.split('/')[-1]
+                    local_path = temp_dir / filename
+                    
+                    # Скачиваем кадр
+                    self.s3_client.download_file(
+                        self.bucket_name,
+                        frame_key,
+                        str(local_path)
+                    )
+                    
+                    # Извлекаем timestamp из filename или metadata
+                    # Предполагаем формат: frame_XXXXXX.jpg
+                    frame_number = 0
+                    timestamp = 0.0
+                    
+                    # Пытаемся извлечь номер кадра из имени файла
+                    match = re.search(r'frame_(\d+)', filename)
+                    if match:
+                        frame_number = int(match.group(1))
+                        timestamp = frame_number * 16 / 30  # Примерно каждый 16-й кадр при 30 FPS
+                    
+                    frames_data.append({
+                        'filename': filename,
+                        'local_path': str(local_path),
+                        'frame_number': frame_number,
+                        'timestamp': timestamp,
+                        'cloud_key': frame_key
+                    })
+                    
+                except Exception as e:
+                    logger.warning(f"Ошибка загрузки кадра {frame_key}: {e}")
+                    continue
+            
+            # Сортируем по номеру кадра
+            frames_data.sort(key=lambda x: x['frame_number'])
+            
+            logger.info(f"Загружено {len(frames_data)} кадров для {video_id}")
+            return frames_data
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки кадров {video_id}: {e}")
+            return []
+    
+    def get_clip_embeddings_for_frames(self, frames_data: List[Dict]) -> List[Dict]:
+        """Получение CLIP эмбеддингов для кадров"""
+        try:
+            frames_with_embeddings = []
+            
+            logger.info(f"Получение CLIP эмбеддингов для {len(frames_data)} кадров...")
+            
+            for frame_data in frames_data:
+                try:
+                    # Загружаем изображение
+                    image = Image.open(frame_data['local_path'])
+                    
+                    # Получаем CLIP эмбеддинг
+                    with torch.no_grad():
+                        image_input = self.clip_preprocess(image).unsqueeze(0).to(self.device)
+                        image_features = self.clip_model.encode_image(image_input)
+                        image_embedding = image_features.float().cpu().numpy().flatten()
+                    
+                    # Добавляем эмбеддинг к данным кадра
+                    frame_with_embedding = frame_data.copy()
+                    frame_with_embedding['embedding'] = image_embedding
+                    
+                    frames_with_embeddings.append(frame_with_embedding)
+                    
+                    self.stats['frames_processed'] += 1
+                    
+                except Exception as e:
+                    logger.warning(f"Ошибка обработки кадра {frame_data['filename']}: {e}")
+                    continue
+            
+            logger.info(f"Получены эмбеддинги для {len(frames_with_embeddings)} кадров")
+            return frames_with_embeddings
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения CLIP эмбеддингов: {e}")
+            return []
+    
+    def select_closest_frames_to_question(self, frames_with_embeddings: List[Dict], 
+                                         question_embedding: np.ndarray) -> List[Dict]:
+        """Выбор кадров ближайших к вопросу"""
+        try:
+            if len(frames_with_embeddings) <= self.max_frames:
+                logger.info(f"Кадров мало ({len(frames_with_embeddings)}), возвращаем все")
+                for i, frame in enumerate(frames_with_embeddings):
+                    frame['selection_order'] = i
+                    frame['distance_to_question'] = 0.0
+                return frames_with_embeddings
+            
+            # Создаем матрицу эмбеддингов кадров
+            frame_embeddings = np.array([frame['embedding'] for frame in frames_with_embeddings])
+            
+            # Вычисляем cosine distances до вопроса
+            distances_to_question = cosine_distances([question_embedding], frame_embeddings)[0]
+            
+            # Находим индексы N ближайших кадров
+            closest_indices = np.argsort(distances_to_question)[:self.max_frames]
+            
+            logger.info(f"Расстояния: min={distances_to_question.min():.3f}, max={distances_to_question.max():.3f}")
+            
+            # Выбираем ближайшие кадры
+            selected_frames = []
+            for idx in closest_indices:
+                frame = frames_with_embeddings[idx].copy()
+                frame['distance_to_question'] = float(distances_to_question[idx])
+                selected_frames.append(frame)
+            
+            # Сортируем по времени для логичной последовательности
+            selected_frames.sort(key=lambda x: x['timestamp'])
+            
+            # Присваиваем порядковые номера
+            for i, frame in enumerate(selected_frames):
+                frame['selection_order'] = i
+            
+            logger.info(f"Выбрано {len(selected_frames)} кадров ближайших к вопросу")
+            logger.info(f"Диапазон расстояний выбранных: {min(f['distance_to_question'] for f in selected_frames):.3f} - {max(f['distance_to_question'] for f in selected_frames):.3f}")
+            
+            return selected_frames
+            
+        except Exception as e:
+            logger.error(f"Ошибка выбора ближайших кадров: {e}")
+            return frames_with_embeddings[:self.max_frames]
+    
+    def send_qwen_request_with_logprobs(self, question: str, selected_frames: List[Dict]) -> Optional[Dict]:
+        """Отправка запроса к Qwen с logprobs"""
+        models_to_try = [self.model_name] + self.backup_models
+        
+        for model_name in models_to_try:
+            try:
+                logger.info(f"Запрос к {model_name} с {len(selected_frames)} ближайшими кадрами...")
+                
+                content = [
+                    {
+                        "type": "text",
+                        "text": f"""Answer the following multiple choice question about the video based on these frames selected as most relevant to the question:
+
+{question}
+
+Analyze the frames carefully and choose the most appropriate answer. The frames are selected based on CLIP similarity to the question. Respond with ONLY the letter of the correct answer (A, B, C, D, or E). Do not provide any explanation or additional text."""
+                    }
+                ]
+                
+                # Добавляем изображения
+                for i, frame in enumerate(selected_frames):
+                    try:
+                        with open(frame['local_path'], 'rb') as f:
+                            import base64
+                            image_data = base64.b64encode(f.read()).decode('utf-8')
+                        
+                        content.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_data}"
+                            }
+                        })
+                        
+                        content.append({
+                            "type": "text",
+                            "text": f"Frame {i+1}: t={frame['timestamp']:.1f}s (distance={frame['distance_to_question']:.3f})"
+                        })
+                        
+                    except Exception as e:
+                        logger.warning(f"Ошибка загрузки кадра {frame['filename']}: {e}")
+                        continue
+                
+                payload = {
+                    "model": model_name,
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                    "logprobs": True,
+                    "top_logprobs": 5,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": content
+                        }
+                    ]
+                }
+                
+                headers = {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.FIREWORKS_API_KEY}"
+                }
+                
+                response = requests.post(self.fireworks_url, headers=headers, 
+                                       json=payload, timeout=180)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if 'choices' in result and len(result['choices']) > 0:
+                        choice = result['choices'][0]
+                        
+                        return {
+                            'response_text': choice['message']['content'],
+                            'logprobs': choice.get('logprobs', {}),
+                            'model_used': model_name
+                        }
+                
+                elif response.status_code == 404:
+                    logger.warning(f"Модель {model_name} не найдена (404)")
+                    continue
+                
+                else:
+                    logger.warning(f"Ошибка {response.status_code} для {model_name}: {response.text}")
+                    continue
+                    
+            except Exception as e:
+                logger.warning(f"Ошибка для {model_name}: {e}")
+                continue
+        
+        return None
+    
+    def extract_answer_from_logprobs(self, result: Dict) -> Optional[str]:
+        """Извлечение ответа из logprobs токенов A, B, C, D, E"""
+        try:
+            if not result or 'logprobs' not in result:
+                return None
+                
+            logprobs_data = result['logprobs']
+            
+            if 'content' in logprobs_data and logprobs_data['content']:
+                content = logprobs_data['content'][0]
+                
+                if 'top_logprobs' in content:
+                    answer_logprobs = {}
+                    
+                    for token_info in content['top_logprobs']:
+                        token = token_info['token'].strip().upper()
+                        logprob = token_info['logprob']
+                        
+                        if token in self.answer_choices:
+                            answer_logprobs[token] = logprob
+                    
+                    if answer_logprobs:
+                        best_answer = max(answer_logprobs.items(), key=lambda x: x[1])[0]
+                        logger.info(f"Logprobs: {answer_logprobs}, выбран: {best_answer}")
+                        return best_answer
+                
+                elif 'token' in content:
+                    token = content['token'].strip().upper()
+                    if token in self.answer_choices:
+                        return token
+            
+            # Fallback
+            response_text = result.get('response_text', '')
+            if response_text:
+                for choice in self.answer_choices:
+                    if choice in response_text.upper():
+                        return choice
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка извлечения ответа из logprobs: {e}")
+            return None
+    
+    def process_single_video_simple(self, video_id: str, category: str) -> Dict:
+        """Простая обработка одного видео"""
+        try:
+            logger.info(f"\n{'='*80}")
+            logger.info(f"ПРОСТАЯ ОБРАБОТКА: {video_id} ({category})")
+            logger.info(f"{'='*80}")
+            
+            # Получаем вопрос
+            key = (video_id, category)
+            if key not in self.dataset_index:
+                raise Exception(f"Вопрос не найден для {video_id}")
+            
+            sample = self.dataset_index[key]
+            conversations = sample['conversations']
+            
+            if not conversations or len(conversations) < 2:
+                raise Exception("Некорректный формат разговора")
+            
+            question = conversations[0]['value']
+            true_answer = conversations[1]['value']
+            
+            # Извлекаем правильный ответ
+            true_letter = None
+            for choice in self.answer_choices:
+                if choice in true_answer.upper():
+                    true_letter = choice
+                    break
+            
+            if not true_letter:
+                raise Exception("Не удалось извлечь правильный ответ")
+            
+            logger.info(f"Вопрос: {question[:100]}...")
+            logger.info(f"Правильный ответ: {true_letter}")
+            
+            # Получаем эмбеддинг вопроса
+            question_embedding = self.get_question_embedding_cached(question)
+            if question_embedding is None:
+                raise Exception("Не удалось получить эмбеддинг вопроса")
+            
+            # Загружаем кадры из облака
+            frames_data = self.load_frames_from_cloud(video_id, category)
+            if not frames_data:
+                raise Exception("Не удалось загрузить кадры")
+            
+            # Получаем CLIP эмбеддинги для кадров
+            frames_with_embeddings = self.get_clip_embeddings_for_frames(frames_data)
+            if not frames_with_embeddings:
+                raise Exception("Не удалось получить эмбеддинги кадров")
+            
+            # Выбираем ближайшие к вопросу кадры
+            selected_frames = self.select_closest_frames_to_question(frames_with_embeddings, question_embedding)
+            if not selected_frames:
+                raise Exception("Не удалось выбрать кадры")
+            
+            # Отправляем запрос к Qwen с logprobs
+            result = self.send_qwen_request_with_logprobs(question, selected_frames)
+            if not result:
+                raise Exception("Нет ответа от Qwen")
+            
+            # Извлекаем ответ из logprobs
+            predicted_letter = self.extract_answer_from_logprobs(result)
+            if not predicted_letter:
+                raise Exception("Не удалось извлечь ответ модели")
+            
+            # Результат
+            is_correct = predicted_letter == true_letter
+            
+            # Обновляем статистику
+            self.stats['videos_processed'] += 1
+            self.stats['total_questions'] += 1
+            self.stats['by_category'][category]['total'] += 1
+            
+            if is_correct:
+                self.stats['correct_answers'] += 1
+                self.stats['by_category'][category]['correct'] += 1
+            
+            final_result = {
+                'video_id': video_id,
+                'category': category,
+                'question': question,
+                'true_answer': true_letter,
+                'predicted_answer': predicted_letter,
+                'is_correct': is_correct,
+                'qwen_response': result['response_text'],
+                'qwen_logprobs': result['logprobs'],
+                'model_used': result['model_used'],
+                'total_frames_available': len(frames_data),
+                'frames_with_embeddings': len(frames_with_embeddings),
+                'selected_frames': len(selected_frames),
+                'selection_method': 'closest_to_question_clip_similarity',
+                'selection_details': [
+                    {
+                        'order': int(f['selection_order']),
+                        'filename': f['filename'],
+                        'frame_number': int(f['frame_number']),
+                        'timestamp': float(f['timestamp']),
+                        'distance_to_question': float(f['distance_to_question'])
+                    }
+                    for f in selected_frames
+                ]
+            }
+            
+            logger.info(f"РЕЗУЛЬТАТ: {predicted_letter} vs {true_letter} {'CORRECT' if is_correct else 'WRONG'}")
+            logger.info(f"Использовано {len(selected_frames)} кадров из {len(frames_data)} доступных")
+            
+            # Очищаем временные файлы
+            import shutil
+            temp_frames_dir = Path('temp_frames_simple') / video_id
+            if temp_frames_dir.exists():
+                shutil.rmtree(temp_frames_dir)
+            
+            return final_result
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки видео {video_id}: {e}")
+            self.stats['errors'] += 1
+            
+            # Очищаем временные файлы при ошибке
+            import shutil
+            temp_frames_dir = Path('temp_frames_simple') / video_id
+            if temp_frames_dir.exists():
+                shutil.rmtree(temp_frames_dir)
+            
+            return {
+                'video_id': video_id,
+                'category': category,
+                'error': str(e),
+                'is_correct': False
+            }
+    
+    def run_simple_full_evaluation(self, max_videos_per_category: int = None):
+        """Запуск полной простой оценки на всех видео"""
+        logger.info(f"\nПОЛНАЯ ПРОСТАЯ ОЦЕНКА")
+        logger.info(f"Подход: кадры из облака → CLIP эмбеддинги → ближайшие к вопросу → Qwen")
+        
+        # Подсчитываем общее количество видео
+        total_videos = 0
+        for category, videos in self.available_videos.items():
+            if max_videos_per_category:
+                total_videos += min(len(videos), max_videos_per_category)
+            else:
+                total_videos += len(videos)
+        
+        logger.info(f"ПЛАНИРУЕМАЯ ПРОСТАЯ ОЦЕНКА:")
+        logger.info(f"  Всего видео: {total_videos}")
+        logger.info(f"  Кадров на видео: {self.max_frames}")
+        logger.info(f"  Примерное время: ~{total_videos * 1.5 / 60:.1f} часов")
+        
+        confirm = input("\nЗапустить простую полную оценку? (y/N): ")
+        if confirm.lower() != 'y':
+            logger.info("Отменено пользователем")
+            return
+        
+        # Результаты
+        all_results = []
+        
+        # Обрабатываем категории
+        for category in self.categories:
+            if category not in self.available_videos:
+                continue
+            
+            videos = self.available_videos[category]
+            if max_videos_per_category:
+                videos = videos[:max_videos_per_category]
+            
+            logger.info(f"\nПРОСТАЯ ОБРАБОТКА КАТЕГОРИИ: {category} ({len(videos)} видео)")
+            
+            # Обрабатываем видео в категории
+            for i, video_id in enumerate(tqdm(videos, desc=f"Simple {category}")):
+                logger.info(f"\nВидео {i+1}/{len(videos)}: {video_id}")
+                
+                result = self.process_single_video_simple(video_id, category)
+                all_results.append(result)
+                
+                # Показываем промежуточную статистику
+                if (i + 1) % 5 == 0:
+                    current_accuracy = (self.stats['correct_answers'] / self.stats['total_questions'] * 100) if self.stats['total_questions'] > 0 else 0
+                    logger.info(f"Промежуточная точность: {self.stats['correct_answers']}/{self.stats['total_questions']} ({current_accuracy:.1f}%)")
+                    logger.info(f"Кадров обработано: {self.stats['frames_processed']}")
+                
+                # Пауза
+                time.sleep(0.5)
+        
+        # Финальные результаты
+        self._show_simple_final_results(all_results)
+        
+        # Сохраняем результаты
+        self._save_simple_results(all_results)
+        
+        return all_results
+    
+    def _show_simple_final_results(self, all_results: List[Dict]):
+        """Показ финальных результатов простой оценки"""
+        total_time = datetime.now() - self.stats['start_time']
+        overall_accuracy = (self.stats['correct_answers'] / self.stats['total_questions'] * 100) if self.stats['total_questions'] > 0 else 0
+        
+        logger.info(f"\n{'='*80}")
+        logger.info("ФИНАЛЬНЫЕ РЕЗУЛЬТАТЫ ПРОСТОЙ ОЦЕНКИ")
+        logger.info(f"{'='*80}")
+        logger.info(f"Время обработки: {total_time}")
+        logger.info(f"Видео обработано: {self.stats['videos_processed']}")
+        logger.info(f"Вопросов: {self.stats['total_questions']}")
+        logger.info(f"Правильных ответов: {self.stats['correct_answers']}")
+        logger.info(f"ИТОГОВАЯ ACCURACY: {overall_accuracy:.2f}%")
+        logger.info(f"Ошибок: {self.stats['errors']}")
+        logger.info(f"Кадров обработано: {self.stats['frames_processed']}")
+        
+        logger.info(f"\nРЕЗУЛЬТАТЫ ПО КАТЕГОРИЯМ:")
+        logger.info(f"{'Категория':<25} {'Правильных':<12} {'Всего':<8} {'Accuracy':<10}")
+        logger.info("-" * 60)
+        
+        for category in self.categories:
+            if category in self.stats['by_category']:
+                stats = self.stats['by_category'][category]
+                if stats['total'] > 0:
+                    acc = (stats['correct'] / stats['total'] * 100)
+                    logger.info(f"{category:<25} {stats['correct']:<12} {stats['total']:<8} {acc:>7.1f}%")
+    
+    def _save_simple_results(self, all_results: List[Dict]):
+        """Сохранение результатов простой оценки"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        
+        # Подробные результаты
+        results_file = Path('simple_results') / f"simple_evaluation_{timestamp}.json"
+        
+        final_results = {
+            'experiment_info': {
+                'method': 'simple_frames_from_cloud_clip_similarity',
+                'model': self.model_name,
+                'max_frames': self.max_frames,
+                'selection_method': 'closest_to_question_clip_similarity',
+                'answer_extraction_method': 'logprobs',
+                'timestamp': datetime.now().isoformat(),
+                'total_time': str(datetime.now() - self.stats['start_time'])
+            },
+            'overall_stats': {
+                'videos_processed': self.stats['videos_processed'],
+                'total_questions': self.stats['total_questions'],
+                'correct_answers': self.stats['correct_answers'],
+                'accuracy': (self.stats['correct_answers'] / self.stats['total_questions'] * 100) if self.stats['total_questions'] > 0 else 0,
+                'errors': self.stats['errors'],
+                'frames_processed': self.stats['frames_processed']
+            },
+            'results_by_category': dict(self.stats['by_category']),
+            'detailed_results': all_results
+        }
+        
+        with open(results_file, 'w', encoding='utf-8') as f:
+            json.dump(final_results, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Результаты сохранены: {results_file}")
+        
+        # Краткая сводка
+        summary_file = Path('simple_results') / f"simple_summary_{timestamp}.txt"
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            f.write("ПРОСТАЯ ОЦЕНКА ФРЕЙМОВ - СВОДКА РЕЗУЛЬТАТОВ\n")
+            f.write("=" * 50 + "\n\n")
+            f.write(f"ИТОГОВАЯ ACCURACY: {final_results['overall_stats']['accuracy']:.2f}%\n")
+            f.write(f"Обработано видео: {final_results['overall_stats']['videos_processed']}\n")
+            f.write(f"Правильных ответов: {final_results['overall_stats']['correct_answers']}\n")
+            f.write(f"Всего вопросов: {final_results['overall_stats']['total_questions']}\n")
+            f.write(f"Кадров обработано: {final_results['overall_stats']['frames_processed']}\n\n")
+            
+            f.write("МЕТОД: Кадры из облака → CLIP эмбеддинги → ближайшие к вопросу\n\n")
+            
+            f.write("Результаты по категориям:\n")
+            for category in self.categories:
+                if category in self.stats['by_category']:
+                    stats = self.stats['by_category'][category]
+                    if stats['total'] > 0:
+                        acc = (stats['correct'] / stats['total'] * 100)
+                        f.write(f"{category}: {stats['correct']}/{stats['total']} ({acc:.1f}%)\n")
+        
+        logger.info(f"Сводка сохранена: {summary_file}")
+
+def main():
+    """Главная функция"""
+    print("ПРОСТОЙ И ЭФФЕКТИВНЫЙ СЕЛЕКТОР ФРЕЙМОВ")
+    print("=" * 50)
+    
+    try:
+        selector = SimpleFrameSelector()
+        
+        # Показываем статистику видео
+        print(f"\nДОСТУПНЫЕ ОБРАБОТАННЫЕ ВИДЕО:")
+        for category, videos in selector.available_videos.items():
+            print(f"  {category}: {len(videos)} видео")
+        
+        total_videos = sum(len(videos) for videos in selector.available_videos.values())
+        print(f"\nВсего видео: {total_videos}")
+        
+        print(f"\nПРОСТОЙ ПОДХОД:")
+        print("• Загружаем кадры из облака как изображения")
+        print("• Получаем CLIP эмбеддинги заново для точности")
+        print("• Ищем ближайшие к вопросу по cosine similarity")
+        print("• Отправляем в Qwen с logprobs")
+        print("• Никаких сложных кластеризаций!")
+        
+        print(f"\nВарианты запуска:")
+        print("1. Полная простая оценка на всех видео")
+        print("2. Ограниченная оценка (по N видео на категорию)")
+        
+        choice = input("\nВыберите вариант (1-2): ").strip()
+        
+        if choice == '1':
+            results = selector.run_simple_full_evaluation()
+        elif choice == '2':
+            n = int(input("Сколько видео на категорию? "))
+            results = selector.run_simple_full_evaluation(max_videos_per_category=n)
+        else:
+            print("Неверный выбор")
+            return
+        
+        print("\nПРОСТАЯ ОЦЕНКА ЗАВЕРШЕНА!")
+        print("Результаты сохранены в папке simple_results/")
+        
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем")
+    except Exception as e:
+        print(f"\nОшибка: {e}")
+
+if __name__ == "__main__":
+    main()
