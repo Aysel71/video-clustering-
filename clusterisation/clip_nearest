@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-=====================================
-1. Берем кадры из облака (processed_frames)
-2. Получаем для них CLIP эмбеддинги заново
-3. Получаем CLIP эмбеддинг вопроса
-4. Ищем N ближайших кадров к вопросу
-5. Отправляем в Qwen с logprobs
-6. Полная оценка на всех видео
+COMPLETE OPTIMIZED ADAPTIVE SELECTOR WITH FIXES
+===============================================
+
+Fixes:
+1. Safe cloud upload (fixed filename errors)
+2. Retry mechanism for reliability
+3. Fallback to local storage
+4. Improved error handling
+5. Detailed progress and logging
 """
 
 import os
 import json
 import logging
+import cv2
 import boto3
+import yt_dlp
 import torch
 import clip
+import random
 import numpy as np
 import requests
 import time
@@ -22,22 +27,23 @@ import re
 from PIL import Image
 from pathlib import Path
 from datetime import datetime
-from sklearn.metrics.pairwise import cosine_distances
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.metrics.pairwise import cosine_similarity, cosine_distances
 from datasets import load_dataset
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
-import threading
 import warnings
 warnings.filterwarnings('ignore')
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 def setup_logging():
-    """Настройка логирования"""
+    """Setup logging"""
     log_format = '%(asctime)s - %(levelname)s - %(message)s'
     Path('logs').mkdir(exist_ok=True)
-    log_filename = f"logs/simple_selector_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_filename = f"logs/adaptive_selection_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     
     logging.basicConfig(
         level=logging.INFO,
@@ -51,14 +57,21 @@ def setup_logging():
 
 logger = setup_logging()
 
-class SimpleFrameSelector:
-    """Простой селектор фреймов: кадры из облака + CLIP + ближайшие к вопросу"""
+class OptimizedFrameSelector:
+    """Optimized selector with fixed cloud upload"""
     
     def __init__(self, bucket_name: str = "videoresearch"):
         self.bucket_name = bucket_name
-        self.max_frames = 8  # Количество кадров для отправки в Qwen
+        self.frame_interval = 16
+        self.max_frames = 8
+        self.min_clusters = 2
+        self.max_clusters = 6
         
-        # API конфигурация
+        # Cloud paths
+        self.cloud_frames_prefix = "extracted_frames/"
+        self.cloud_selected_prefix = "selected_frames_adaptive/"
+        
+        # API configuration
         self.FIREWORKS_API_KEY = "key"
         self.fireworks_url = "https://api.fireworks.ai/inference/v1/chat/completions"
         self.model_name = "fireworks/qwen2p5-vl-32b-instruct"
@@ -68,7 +81,6 @@ class SimpleFrameSelector:
             "fireworks/llava-v1p6-34b-instruct"
         ]
         
-        # Категории
         self.categories = [
             'Action Recognition', 'Action Reasoning', 'Attribute Perception',
             'Counting Problem', 'OCR Problems', 'Object Recognition',
@@ -78,108 +90,153 @@ class SimpleFrameSelector:
         
         self.answer_choices = ['A', 'B', 'C', 'D', 'E']
         
-        # Кэширование для ускорения
-        self.question_embeddings_cache = {}
-        self.cache_lock = threading.Lock()
-        
         self._setup_system()
         
-        # Статистика
+        # Statistics with save information
         self.stats = {
             'start_time': datetime.now(),
-            'videos_processed': 0,
-            'correct_answers': 0,
-            'total_questions': 0,
-            'errors': 0,
-            'frames_processed': 0,
-            'by_category': defaultdict(lambda: {'correct': 0, 'total': 0})
+            
+            # Processing attempts
+            'attempted': {
+                'total_videos': 0,
+                'by_category': defaultdict(int)
+            },
+            
+            # Successfully processed
+            'successfully_processed': {
+                'total_videos': 0,
+                'correct_answers': 0,
+                'by_category': defaultdict(lambda: {'correct': 0, 'total': 0})
+            },
+            
+            # Errors by type
+            'errors': {
+                'download_failed': 0,
+                'frame_extraction_failed': 0,
+                'api_request_failed': 0,
+                'answer_extraction_failed': 0,
+                'cloud_upload_failed': 0,
+                'other_errors': 0,
+                'by_category': defaultdict(lambda: {
+                    'download_failed': 0,
+                    'frame_extraction_failed': 0,
+                    'api_request_failed': 0,
+                    'answer_extraction_failed': 0,
+                    'cloud_upload_failed': 0,
+                    'other_errors': 0
+                })
+            },
+            
+            # Frame extraction statistics
+            'frame_extraction': {
+                'total_extractions': 0,
+                'successful_uploads': 0,
+                'partial_uploads': 0,
+                'failed_uploads': 0,
+                'total_frames_extracted': 0
+            }
         }
     
     def _setup_system(self):
-        """Настройка системы"""
-        logger.info("ПРОСТОЙ СЕЛЕКТОР ФРЕЙМОВ - ИНИЦИАЛИЗАЦИЯ")
+        """System setup"""
+        logger.info("Initializing optimized frame selector")
         
         self._setup_device()
         self._setup_cloud_storage()
         self._load_clip_model()
-        self._load_dataset()
+        self._setup_ytdlp()
         self._create_directories()
+        self._load_dataset()
         self._scan_available_videos()
         
-        logger.info("Система готова для простого подхода")
+        logger.info("System initialized")
     
     def _setup_device(self):
-        """Настройка устройства"""
+        """Device setup"""
         torch.set_default_dtype(torch.float32)
         
         if torch.backends.mps.is_available():
             self.device = "mps"
-            logger.info("Используется Apple Silicon GPU (MPS)")
+            logger.info("Using Apple Silicon GPU (MPS)")
         elif torch.cuda.is_available():
             self.device = "cuda"
-            logger.info("Используется NVIDIA GPU")
+            logger.info("Using NVIDIA GPU")
         else:
             self.device = "cpu"
-            logger.info("Используется CPU")
+            logger.info("Using CPU")
     
     def _setup_cloud_storage(self):
-        """Настройка облачного хранилища"""
-        access_key = os.getenv('YANDEX_ACCESS_KEY') 
-        secret_key = os.getenv('YANDEX_SECRET_KEY')
+        """Setup Yandex Cloud Storage"""
+        access_key = os.getenv('YANDEX_ACCESS_KEY') or "key"
+        secret_key = os.getenv('YANDEX_SECRET_KEY') or "key"
         
         self.s3_client = boto3.client(
             's3',
             endpoint_url='https://storage.yandexcloud.net',
             aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            config=boto3.session.Config(
-                max_pool_connections=20,
-                retries={'max_attempts': 3}
-            )
+            aws_secret_access_key=secret_key
         )
         
-        logger.info("Подключение к Yandex Cloud установлено")
+        logger.info("Yandex Cloud connection established")
     
     def _load_clip_model(self):
-        """Загрузка CLIP модели"""
-        logger.info("Загрузка CLIP модели...")
+        """Load CLIP model"""
+        logger.info("Loading CLIP model...")
         self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
         self.clip_model = self.clip_model.float()
         self.clip_model.eval()
-        logger.info("CLIP модель загружена")
+        logger.info("CLIP model loaded")
+    
+    def _setup_ytdlp(self):
+        """Setup yt-dlp"""
+        user_agents = [
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        ]
+        
+        self.ydl_opts = {
+            'format': 'best[height<=720]/best',
+            'outtmpl': '%(id)s.%(ext)s',
+            'writeinfojson': True,
+            'ignoreerrors': True,
+            'quiet': True,
+            'no_warnings': True,
+            'http_headers': {
+                'User-Agent': random.choice(user_agents)
+            }
+        }
+    
+    def _create_directories(self):
+        """Create directories"""
+        directories = [
+            'temp_videos', 'temp_frames', 'adaptive_results', 
+            'selected_frames_adaptive', 'logs', 'downloaded_frames'
+        ]
+        for directory in directories:
+            Path(directory).mkdir(exist_ok=True)
     
     def _load_dataset(self):
-        """Загрузка датасета с вопросами"""
-        logger.info("Загрузка датасета...")
+        """Load dataset with questions"""
+        logger.info("Loading dataset...")
         
         self.dataset = load_dataset("facebook/PLM-Video-Auto", "yt1b_mcqa", split="train")
         
-        # Создаем индекс
         self.dataset_index = {}
         for sample in self.dataset:
             if sample['category'] in self.categories:
                 key = (sample['video_id'], sample['category'])
                 self.dataset_index[key] = sample
         
-        logger.info(f"Загружено {len(self.dataset_index)} вопросов")
-    
-    def _create_directories(self):
-        """Создание директорий"""
-        directories = [
-            'logs', 'simple_results', 'temp_frames_simple'
-        ]
-        for directory in directories:
-            Path(directory).mkdir(exist_ok=True)
+        logger.info(f"Loaded {len(self.dataset_index)} questions")
     
     def _scan_available_videos(self):
-        """Сканирование доступных обработанных видео"""
-        logger.info("Сканирование обработанных видео...")
+        """Scan available videos"""
+        logger.info("Scanning available videos...")
         
         self.available_videos = defaultdict(list)
         
         for category in self.categories:
             try:
-                prefix = f"processed_frames/{category}/"
+                prefix = f"frames/{category}/"
                 response = self.s3_client.list_objects_v2(
                     Bucket=self.bucket_name,
                     Prefix=prefix,
@@ -190,247 +247,667 @@ class SimpleFrameSelector:
                     for obj in response['CommonPrefixes']:
                         video_id = obj['Prefix'].split('/')[-2]
                         
-                        # Проверяем, что есть вопрос для этого видео
                         key = (video_id, category)
                         if key in self.dataset_index:
                             self.available_videos[category].append(video_id)
                 
-                logger.info(f"  {category}: {len(self.available_videos[category])} видео")
+                logger.info(f"{category}: {len(self.available_videos[category])} videos")
                 
             except Exception as e:
-                logger.warning(f"Ошибка сканирования {category}: {e}")
+                logger.warning(f"Error scanning {category}: {e}")
         
         total_videos = sum(len(videos) for videos in self.available_videos.values())
-        logger.info(f"Всего доступно {total_videos} обработанных видео")
-    
-    def get_question_embedding_cached(self, question_text: str) -> np.ndarray:
-        """Получение CLIP эмбеддинга вопроса с кэшированием"""
-        question_hash = hash(question_text)
-        
-        with self.cache_lock:
-            if question_hash in self.question_embeddings_cache:
-                return self.question_embeddings_cache[question_hash]
-        
+        logger.info(f"Total available {total_videos} videos with questions")
+
+    def check_frames_in_cloud(self, video_id: str) -> bool:
+        """Check if frames exist in cloud"""
         try:
-            # Очищаем и обрезаем вопрос для CLIP (максимум 77 токенов)
+            # Check safe name as well
+            safe_video_id = re.sub(r'^[-_]+', '', video_id)
+            safe_video_id = re.sub(r'[^a-zA-Z0-9_-]', '_', safe_video_id)
+            safe_video_id = safe_video_id[:50]
+            
+            for vid in [video_id, safe_video_id]:
+                cloud_path = f"{self.cloud_frames_prefix}{vid}/"
+                response = self.s3_client.list_objects_v2(
+                    Bucket=self.bucket_name,
+                    Prefix=cloud_path,
+                    MaxKeys=1
+                )
+                
+                if 'Contents' in response and len(response['Contents']) > 0:
+                    logger.info(f"Frames for {video_id} found in cloud: {cloud_path}")
+                    return True
+            
+            logger.info(f"Frames for {video_id} NOT found in cloud")
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Error checking cloud for {video_id}: {e}")
+            return False
+
+    def download_frames_from_cloud(self, video_id: str) -> List[Dict]:
+        """Download frames and metadata from cloud"""
+        try:
+            logger.info(f"Downloading frames {video_id} from cloud...")
+            
+            # Try original and safe name
+            safe_video_id = re.sub(r'^[-_]+', '', video_id)
+            safe_video_id = re.sub(r'[^a-zA-Z0-9_-]', '_', safe_video_id)
+            safe_video_id = safe_video_id[:50]
+            
+            metadata_found = False
+            metadata = None
+            
+            for vid in [video_id, safe_video_id]:
+                try:
+                    metadata_key = f"{self.cloud_frames_prefix}{vid}/metadata.json"
+                    response = self.s3_client.get_object(Bucket=self.bucket_name, Key=metadata_key)
+                    metadata = json.loads(response['Body'].read().decode('utf-8'))
+                    metadata_found = True
+                    logger.info(f"Metadata found for ID: {vid}")
+                    break
+                except Exception:
+                    continue
+            
+            if not metadata_found:
+                raise Exception("Metadata not found")
+            
+            # Create local folder
+            local_frames_dir = Path('downloaded_frames') / video_id
+            local_frames_dir.mkdir(parents=True, exist_ok=True)
+            
+            frames = []
+            cloud_base_path = f"{self.cloud_frames_prefix}{vid}/"
+            
+            for frame_info in metadata['frames']:
+                # Download each frame
+                cloud_frame_key = f"{cloud_base_path}{frame_info['filename']}"
+                local_frame_path = local_frames_dir / frame_info['filename']
+                
+                try:
+                    self.s3_client.download_file(
+                        self.bucket_name, 
+                        cloud_frame_key, 
+                        str(local_frame_path)
+                    )
+                    
+                    # Restore frame structure
+                    frame = {
+                        'index': frame_info['index'],
+                        'frame_number': frame_info['frame_number'],
+                        'timestamp': frame_info['timestamp'],
+                        'filename': frame_info['filename'],
+                        'path': str(local_frame_path),
+                        'embedding': np.array(frame_info['embedding'])
+                    }
+                    
+                    frames.append(frame)
+                    
+                except Exception as frame_error:
+                    logger.warning(f"Error downloading frame {frame_info['filename']}: {frame_error}")
+                    continue
+            
+            logger.info(f"Downloaded {len(frames)} frames from cloud for {video_id}")
+            self.stats['frame_reuse']['reused_from_cloud'] += 1
+            
+            return frames
+            
+        except Exception as e:
+            logger.error(f"Error downloading frames from cloud for {video_id}: {e}")
+            raise
+
+    def upload_frames_to_cloud(self, frames: List[Dict], video_id: str) -> str:
+        """FIXED cloud upload"""
+        try:
+            # FIX 1: Safe name for cloud
+            safe_video_id = re.sub(r'^[-_]+', '', video_id)  # Remove leading dashes
+            safe_video_id = re.sub(r'[^a-zA-Z0-9_-]', '_', safe_video_id)  # Replace special chars
+            safe_video_id = safe_video_id[:50]  # Limit length
+            
+            if not safe_video_id:  # If name is empty after cleaning
+                safe_video_id = f"video_{hash(video_id) % 100000}"
+            
+            cloud_path = f"{self.cloud_frames_prefix}{safe_video_id}/"
+            logger.info(f"Uploading {len(frames)} frames to cloud: {cloud_path}")
+            logger.info(f"Original ID: {video_id} → Safe ID: {safe_video_id}")
+            
+            uploaded_frames = []
+            failed_uploads = 0
+            
+            # FIX 2: Upload with retry and better error handling
+            for i, frame in enumerate(frames):
+                try:
+                    cloud_key = f"{cloud_path}{frame['filename']}"
+                    
+                    # FIX 3: Check file existence
+                    if not os.path.exists(frame['path']):
+                        logger.warning(f"File not found: {frame['path']}")
+                        failed_uploads += 1
+                        continue
+                    
+                    # FIX 4: Check file size
+                    file_size = os.path.getsize(frame['path'])
+                    if file_size == 0:
+                        logger.warning(f"Empty file: {frame['filename']}")
+                        failed_uploads += 1
+                        continue
+                    
+                    if file_size > 10 * 1024 * 1024:  # 10MB limit
+                        logger.warning(f"File too large: {frame['filename']} ({file_size/1024/1024:.1f}MB)")
+                        failed_uploads += 1
+                        continue
+                    
+                    # FIX 5: Retry mechanism
+                    upload_success = False
+                    for attempt in range(3):
+                        try:
+                            # Use more reliable upload method
+                            with open(frame['path'], 'rb') as f:
+                                self.s3_client.put_object(
+                                    Bucket=self.bucket_name,
+                                    Key=cloud_key,
+                                    Body=f.read(),
+                                    ContentType='image/jpeg',
+                                    Metadata={
+                                        'original_video_id': video_id,
+                                        'frame_number': str(frame['frame_number']),
+                                        'timestamp': str(frame['timestamp'])
+                                    }
+                                )
+                            upload_success = True
+                            break
+                            
+                        except Exception as upload_error:
+                            logger.warning(f"Attempt {attempt + 1}/3 failed for {frame['filename']}: {upload_error}")
+                            if attempt < 2:  # Not last attempt
+                                time.sleep(2 ** attempt)  # Exponential backoff
+                    
+                    if not upload_success:
+                        failed_uploads += 1
+                        logger.error(f"Failed to upload {frame['filename']} after 3 attempts")
+                        continue
+                    
+                    # FIX 6: Save metadata only for successfully uploaded
+                    frame_metadata = {
+                        'index': int(frame['index']),
+                        'frame_number': int(frame['frame_number']),
+                        'timestamp': float(frame['timestamp']),
+                        'filename': frame['filename'],
+                        'embedding': frame['embedding'].tolist(),
+                        'file_size': file_size
+                    }
+                    
+                    uploaded_frames.append(frame_metadata)
+                    
+                    # Progress every 100 frames
+                    if (i + 1) % 100 == 0:
+                        success_rate = ((i + 1 - failed_uploads) / (i + 1)) * 100
+                        logger.info(f"Progress: {i + 1}/{len(frames)} ({success_rate:.1f}% success)")
+                        
+                except Exception as e:
+                    logger.warning(f"General error for frame {i} ({frame.get('filename', 'unknown')}): {e}")
+                    failed_uploads += 1
+                    continue
+            
+            # FIX 7: More tolerant result check
+            success_rate = (len(uploaded_frames) / len(frames)) * 100
+            
+            if len(uploaded_frames) == 0:
+                raise Exception("Failed to upload any frames")
+            
+            if success_rate < 50:  # Less than 50% is a problem
+                logger.warning(f"Low success rate: {success_rate:.1f}%")
+                self.stats['frame_extraction']['partial_uploads'] += 1
+            else:
+                self.stats['frame_extraction']['successful_uploads'] += 1
+            
+            # FIX 8: Extended metadata
+            metadata = {
+                'video_id': safe_video_id,
+                'original_video_id': video_id,
+                'total_frames_attempted': len(frames),
+                'total_frames_uploaded': len(uploaded_frames),
+                'failed_uploads': failed_uploads,
+                'success_rate_percent': success_rate,
+                'frame_interval': getattr(self, 'frame_interval', 16),
+                'extraction_timestamp': datetime.now().isoformat(),
+                'clip_model': 'ViT-B/32',
+                'upload_notes': f"Uploaded {len(uploaded_frames)}/{len(frames)} frames successfully",
+                'frames': uploaded_frames
+            }
+            
+            # FIX 9: Safe metadata upload
+            try:
+                metadata_key = f"{cloud_path}metadata.json"
+                metadata_json = json.dumps(metadata, ensure_ascii=False, indent=2)
+                
+                self.s3_client.put_object(
+                    Bucket=self.bucket_name,
+                    Key=metadata_key,
+                    Body=metadata_json.encode('utf-8'),
+                    ContentType='application/json'
+                )
+                
+                logger.info(f"Metadata saved: {metadata_key}")
+                
+            except Exception as meta_error:
+                logger.error(f"Error saving metadata: {meta_error}")
+                # But don't stop the whole process
+            
+            # FINAL RESULT
+            logger.info(f"UPLOAD COMPLETED:")
+            logger.info(f"  Uploaded: {len(uploaded_frames)}/{len(frames)} ({success_rate:.1f}%)")
+            logger.info(f"  Failures: {failed_uploads}")
+            logger.info(f"  Cloud path: {cloud_path}")
+            
+            return cloud_path
+            
+        except Exception as e:
+            logger.error(f"Critical cloud upload error: {e}")
+            self.stats['frame_extraction']['failed_uploads'] += 1
+            # FIX 10: Even if cloud doesn't work, don't stop the whole process
+            logger.info("Continuing without cloud save")
+            
+            # Return local path
+            return f"local_fallback/{video_id}/"
+
+    def get_question_embedding(self, question_text: str) -> np.ndarray:
+        """Get CLIP embedding of question text"""
+        try:
             clean_question = re.sub(r'[A-E]\)\s*', '', question_text)
             clean_question = re.sub(r'\n+', ' ', clean_question)
+            clean_question = clean_question.strip()
             
-            # Берем только основной вопрос до "Options:"
-            question_parts = clean_question.split('Options:')
-            if len(question_parts) > 1:
-                main_question = question_parts[0].strip()
-            else:
-                question_parts = clean_question.split('Answer')
-                main_question = question_parts[0].strip()
-            
-            # Ограничиваем длину
-            words = main_question.split()
-            if len(words) > 12:
-                main_question = ' '.join(words[:12])
-            
-            logger.debug(f"Вопрос для CLIP: {main_question}")
-            
-            # Получаем эмбеддинг
             with torch.no_grad():
-                text_tokens = clip.tokenize([main_question]).to(self.device)
+                text_tokens = clip.tokenize([clean_question]).to(self.device)
                 text_features = self.clip_model.encode_text(text_tokens)
                 text_embedding = text_features.float().cpu().numpy().flatten()
-            
-            # Кэшируем
-            with self.cache_lock:
-                self.question_embeddings_cache[question_hash] = text_embedding
             
             return text_embedding
             
         except Exception as e:
-            logger.error(f"Ошибка получения эмбеддинга вопроса: {e}")
+            logger.error(f"Error getting question embedding: {e}")
             return None
-    
-    def load_frames_from_cloud(self, video_id: str, category: str) -> List[Dict]:
-        """Загрузка кадров из облака как изображений"""
+
+    def download_video(self, video_id: str) -> str:
+        """Download video"""
         try:
-            # Получаем список кадров
-            prefix = f"processed_frames/{category}/{video_id}/"
-            response = self.s3_client.list_objects_v2(
-                Bucket=self.bucket_name,
-                Prefix=prefix
-            )
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            logger.info(f"Downloading video: {video_id}")
             
-            if 'Contents' not in response:
-                logger.warning(f"Нет кадров для {video_id}")
-                return []
+            temp_dir = Path('temp_videos')
+            ydl_opts = self.ydl_opts.copy()
+            ydl_opts['outtmpl'] = str(temp_dir / f"{video_id}.%(ext)s")
             
-            # Фильтруем только jpg файлы (исключаем metadata.json)
-            frame_objects = [
-                obj for obj in response['Contents'] 
-                if obj['Key'].endswith('.jpg')
-            ]
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(video_url, download=True)
             
-            if not frame_objects:
-                logger.warning(f"Нет jpg кадров для {video_id}")
-                return []
+            for ext in ['mp4', 'webm', 'mkv', 'avi']:
+                potential_file = temp_dir / f"{video_id}.{ext}"
+                if potential_file.exists():
+                    logger.info(f"Video downloaded: {potential_file}")
+                    return str(potential_file)
             
-            logger.info(f"Найдено {len(frame_objects)} кадров для {video_id}")
+            raise Exception("Video file not found after download")
             
-            # Создаем временную папку
-            temp_dir = Path('temp_frames_simple') / video_id
-            temp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Download error {video_id}: {e}")
+            raise Exception(f"download_failed: {e}")
+
+    def extract_frames_with_embeddings(self, video_path: str, video_id: str) -> List[Dict]:
+        """Extract frames with CLIP embeddings"""
+        try:
+            frames_dir = Path('temp_frames') / video_id
+            frames_dir.mkdir(parents=True, exist_ok=True)
             
-            frames_data = []
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise Exception("Could not open video file")
             
-            # Загружаем и обрабатываем кадры
-            for obj in frame_objects:
-                try:
-                    frame_key = obj['Key']
-                    filename = frame_key.split('/')[-1]
-                    local_path = temp_dir / filename
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else total_frames / 30
+            
+            logger.info(f"Video {video_id}: {total_frames} frames, {duration:.1f}s, {fps:.1f} fps")
+            
+            extracted_frames = []
+            frame_number = 0
+            saved_count = 0
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if frame_number % self.frame_interval == 0:
+                    timestamp = frame_number / fps if fps > 0 else frame_number / 30
                     
-                    # Скачиваем кадр
-                    self.s3_client.download_file(
-                        self.bucket_name,
-                        frame_key,
-                        str(local_path)
-                    )
+                    frame_filename = f"frame_{saved_count:04d}.jpg"
+                    frame_path = frames_dir / frame_filename
                     
-                    # Извлекаем timestamp из filename или metadata
-                    # Предполагаем формат: frame_XXXXXX.jpg
-                    frame_number = 0
-                    timestamp = 0.0
+                    cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     
-                    # Пытаемся извлечь номер кадра из имени файла
-                    match = re.search(r'frame_(\d+)', filename)
-                    if match:
-                        frame_number = int(match.group(1))
-                        timestamp = frame_number * 16 / 30  # Примерно каждый 16-й кадр при 30 FPS
+                    # Get CLIP embedding
+                    pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     
-                    frames_data.append({
-                        'filename': filename,
-                        'local_path': str(local_path),
+                    with torch.no_grad():
+                        image_input = self.clip_preprocess(pil_image).unsqueeze(0).to(self.device)
+                        clip_features = self.clip_model.encode_image(image_input)
+                        clip_embedding = clip_features.float().cpu().numpy().flatten()
+                    
+                    extracted_frames.append({
+                        'index': saved_count,
                         'frame_number': frame_number,
                         'timestamp': timestamp,
-                        'cloud_key': frame_key
+                        'filename': frame_filename,
+                        'path': str(frame_path),
+                        'embedding': clip_embedding
                     })
                     
-                except Exception as e:
-                    logger.warning(f"Ошибка загрузки кадра {frame_key}: {e}")
-                    continue
+                    saved_count += 1
+                
+                frame_number += 1
             
-            # Сортируем по номеру кадра
-            frames_data.sort(key=lambda x: x['frame_number'])
+            cap.release()
             
-            logger.info(f"Загружено {len(frames_data)} кадров для {video_id}")
-            return frames_data
+            if not extracted_frames:
+                raise Exception("Could not extract any frames")
+            
+            logger.info(f"Extracted {len(extracted_frames)} frames")
+            self.stats['frame_extraction']['total_extractions'] += 1
+            self.stats['frame_extraction']['total_frames_extracted'] += len(extracted_frames)
+            
+            return extracted_frames
             
         except Exception as e:
-            logger.error(f"Ошибка загрузки кадров {video_id}: {e}")
-            return []
-    
-    def get_clip_embeddings_for_frames(self, frames_data: List[Dict]) -> List[Dict]:
-        """Получение CLIP эмбеддингов для кадров"""
+            logger.error(f"Frame extraction error: {e}")
+            raise Exception(f"frame_extraction_failed: {e}")
+
+    def get_or_extract_frames(self, video_id: str) -> Tuple[List[Dict], str]:
+        """FORCED extraction of new frames for all videos"""
         try:
-            frames_with_embeddings = []
+            # FORCE extraction of new frames for EVERY video
+            logger.info(f"FORCEFULLY extracting new frames for {video_id} (ignoring cloud)")
             
-            logger.info(f"Получение CLIP эмбеддингов для {len(frames_data)} кадров...")
+            # Download video
+            video_path = self.download_video(video_id)
             
-            for frame_data in frames_data:
+            # Extract frames
+            frames = self.extract_frames_with_embeddings(video_path, video_id)
+            
+            # Upload to cloud (OVERWRITE old ones)
+            try:
+                cloud_path = self.upload_frames_to_cloud(frames, video_id)
+                logger.info(f"New frames uploaded to cloud: {cloud_path}")
+            except Exception as cloud_error:
+                logger.warning(f"Cloud unavailable, continuing locally: {cloud_error}")
+                cloud_path = f"local_only/{video_id}/"
+                # DON'T THROW EXCEPTION, continue working
+            
+            # Clean up video
+            try:
+                os.remove(video_path)
+            except Exception:
+                pass
+            
+            return frames, cloud_path
+            
+        except Exception as e:
+            logger.error(f"Error getting frames for {video_id}: {e}")
+            raise
+
+    def find_optimal_clusters(self, embeddings: np.ndarray, video_id: str) -> int:
+        """Find optimal number of clusters"""
+        try:
+            n_samples = len(embeddings)
+            logger.info(f"Finding optimal clusters for {video_id} ({n_samples} frames)")
+            
+            max_k = min(self.max_clusters, n_samples - 1, self.max_frames)
+            min_k = min(self.min_clusters, max_k)
+            
+            if n_samples < 4:
+                logger.info(f"Too few frames ({n_samples}), using 1 cluster")
+                return 1
+            
+            if max_k <= min_k:
+                logger.info(f"Limited cluster range, using {min_k}")
+                return min_k
+            
+            best_score = -1
+            best_k = min_k
+            scores = {}
+            
+            for k in range(min_k, max_k + 1):
                 try:
-                    # Загружаем изображение
-                    image = Image.open(frame_data['local_path'])
+                    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+                    cluster_labels = kmeans.fit_predict(embeddings)
                     
-                    # Получаем CLIP эмбеддинг
-                    with torch.no_grad():
-                        image_input = self.clip_preprocess(image).unsqueeze(0).to(self.device)
-                        image_features = self.clip_model.encode_image(image_input)
-                        image_embedding = image_features.float().cpu().numpy().flatten()
+                    unique_labels = np.unique(cluster_labels)
+                    if len(unique_labels) != k:
+                        logger.warning(f"k={k}: empty clusters")
+                        continue
                     
-                    # Добавляем эмбеддинг к данным кадра
-                    frame_with_embedding = frame_data.copy()
-                    frame_with_embedding['embedding'] = image_embedding
+                    score = silhouette_score(embeddings, cluster_labels)
+                    scores[k] = score
                     
-                    frames_with_embeddings.append(frame_with_embedding)
+                    logger.info(f"k={k}: silhouette={score:.3f}")
                     
-                    self.stats['frames_processed'] += 1
-                    
+                    if score > best_score:
+                        best_score = score
+                        best_k = k
+                        
                 except Exception as e:
-                    logger.warning(f"Ошибка обработки кадра {frame_data['filename']}: {e}")
+                    logger.warning(f"Error for k={k}: {e}")
                     continue
             
-            logger.info(f"Получены эмбеддинги для {len(frames_with_embeddings)} кадров")
-            return frames_with_embeddings
+            if best_score == -1:
+                logger.warning("Could not compute silhouette score, using heuristic")
+                if n_samples <= 10:
+                    best_k = 2
+                elif n_samples <= 50:
+                    best_k = 3
+                elif n_samples <= 100:
+                    best_k = 4
+                else:
+                    best_k = 5
+            
+            logger.info(f"Selected {best_k} clusters for {video_id} (score: {best_score:.3f})")
+            return best_k
             
         except Exception as e:
-            logger.error(f"Ошибка получения CLIP эмбеддингов: {e}")
-            return []
-    
-    def select_closest_frames_to_question(self, frames_with_embeddings: List[Dict], 
-                                         question_embedding: np.ndarray) -> List[Dict]:
-        """Выбор кадров ближайших к вопросу"""
+            logger.error(f"Cluster search error: {e}")
+            if len(embeddings) <= 10:
+                return 2
+            elif len(embeddings) <= 50:
+                return 3
+            else:
+                return 4
+
+    def adaptive_frame_selection(self, frames: List[Dict], question_embedding: np.ndarray, video_id: str) -> List[Dict]:
+        """Adaptive frame selection considering proximity to question"""
         try:
-            if len(frames_with_embeddings) <= self.max_frames:
-                logger.info(f"Кадров мало ({len(frames_with_embeddings)}), возвращаем все")
-                for i, frame in enumerate(frames_with_embeddings):
+            logger.info(f"Adaptive selection from {len(frames)} frames for {video_id}...")
+            
+            if len(frames) <= self.max_frames:
+                logger.info("Few frames, returning all")
+                for i, frame in enumerate(frames):
                     frame['selection_order'] = i
+                    frame['cluster_id'] = 0
                     frame['distance_to_question'] = 0.0
-                return frames_with_embeddings
+                return frames
             
-            # Создаем матрицу эмбеддингов кадров
-            frame_embeddings = np.array([frame['embedding'] for frame in frames_with_embeddings])
+            frame_embeddings = np.array([frame['embedding'] for frame in frames])
             
-            # Вычисляем cosine distances до вопроса
-            distances_to_question = cosine_distances([question_embedding], frame_embeddings)[0]
+            optimal_k = self.find_optimal_clusters(frame_embeddings, video_id)
             
-            # Находим индексы N ближайших кадров
-            closest_indices = np.argsort(distances_to_question)[:self.max_frames]
+            logger.info(f"Clustering with k={optimal_k}...")
+            kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(frame_embeddings)
             
-            logger.info(f"Расстояния: min={distances_to_question.min():.3f}, max={distances_to_question.max():.3f}")
+            clusters = defaultdict(list)
+            for i, label in enumerate(cluster_labels):
+                clusters[label].append(frames[i])
             
-            # Выбираем ближайшие кадры
+            logger.info(f"Created {len(clusters)} clusters:")
+            for cluster_id, cluster_frames in clusters.items():
+                logger.info(f"Cluster {cluster_id}: {len(cluster_frames)} frames")
+            
+            frames_per_cluster = self.max_frames // len(clusters)
+            remaining_frames = self.max_frames % len(clusters)
+            
             selected_frames = []
-            for idx in closest_indices:
-                frame = frames_with_embeddings[idx].copy()
-                frame['distance_to_question'] = float(distances_to_question[idx])
-                selected_frames.append(frame)
             
-            # Сортируем по времени для логичной последовательности
+            for cluster_id, cluster_frames in clusters.items():
+                cluster_embeddings = np.array([frame['embedding'] for frame in cluster_frames])
+                
+                distances_to_question = cosine_distances([question_embedding], cluster_embeddings)[0]
+                
+                num_frames_for_cluster = frames_per_cluster
+                if remaining_frames > 0:
+                    num_frames_for_cluster += 1
+                    remaining_frames -= 1
+                
+                closest_indices = np.argsort(distances_to_question)[:num_frames_for_cluster]
+                
+                for idx in closest_indices:
+                    frame = cluster_frames[idx]
+                    frame['cluster_id'] = int(cluster_id)
+                    frame['distance_to_question'] = float(distances_to_question[idx])
+                    selected_frames.append(frame)
+                
+                logger.info(f"Cluster {cluster_id}: {len(cluster_frames)} frames -> {len(closest_indices)} selected")
+            
             selected_frames.sort(key=lambda x: x['timestamp'])
             
-            # Присваиваем порядковые номера
             for i, frame in enumerate(selected_frames):
                 frame['selection_order'] = i
             
-            logger.info(f"Выбрано {len(selected_frames)} кадров ближайших к вопросу")
-            logger.info(f"Диапазон расстояний выбранных: {min(f['distance_to_question'] for f in selected_frames):.3f} - {max(f['distance_to_question'] for f in selected_frames):.3f}")
+            logger.info(f"Adaptively selected {len(selected_frames)} frames")
             
             return selected_frames
             
         except Exception as e:
-            logger.error(f"Ошибка выбора ближайших кадров: {e}")
-            return frames_with_embeddings[:self.max_frames]
-    
-    def send_qwen_request_with_logprobs(self, question: str, selected_frames: List[Dict]) -> Optional[Dict]:
-        """Отправка запроса к Qwen с logprobs"""
+            logger.error(f"Adaptive selection error: {e}")
+            logger.info("Falling back to uniform selection...")
+            step = max(1, len(frames) // self.max_frames)
+            fallback_frames = frames[::step][:self.max_frames]
+            
+            for i, frame in enumerate(fallback_frames):
+                frame['selection_order'] = i
+                frame['cluster_id'] = 0
+                frame['distance_to_question'] = 0.0
+            
+            return fallback_frames
+
+    def save_selected_frames(self, selected_frames: List[Dict], video_id: str) -> str:
+        """Save selected frames locally and in cloud"""
+        try:
+            # Local save
+            frames_dir = Path('selected_frames_adaptive') / video_id
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            
+            saved_frames = []
+            
+            for frame in selected_frames:
+                new_filename = f"adaptive_{frame['selection_order']+1:02d}_cluster_{frame['cluster_id']}_frame_{frame['frame_number']:06d}.jpg"
+                new_path = frames_dir / new_filename
+                
+                original_image = Image.open(frame['path'])
+                
+                max_size = 1024
+                if original_image.width > max_size or original_image.height > max_size:
+                    original_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                
+                original_image.save(new_path, 'JPEG', quality=85, optimize=True)
+                
+                saved_frames.append({
+                    'selection_order': int(frame['selection_order']),
+                    'cluster_id': int(frame['cluster_id']),
+                    'frame_number': int(frame['frame_number']),
+                    'timestamp': float(frame['timestamp']),
+                    'distance_to_question': float(frame['distance_to_question']),
+                    'filename': new_filename,
+                    'path': str(new_path)
+                })
+            
+            # Save information locally
+            info_file = frames_dir / 'adaptive_selection_info.json'
+            selection_info = {
+                'video_id': video_id,
+                'selection_method': 'adaptive_clustering_with_question_similarity',
+                'model_used': self.model_name,
+                'total_selected': len(selected_frames),
+                'frames': saved_frames,
+                'created_at': datetime.now().isoformat()
+            }
+            
+            with open(info_file, 'w', encoding='utf-8') as f:
+                json.dump(selection_info, f, ensure_ascii=False, indent=2)
+            
+            # Upload to cloud (optional)
+            try:
+                safe_video_id = re.sub(r'^[-_]+', '', video_id)
+                safe_video_id = re.sub(r'[^a-zA-Z0-9_-]', '_', safe_video_id)
+                safe_video_id = safe_video_id[:50]
+                
+                cloud_selected_path = f"{self.cloud_selected_prefix}{safe_video_id}/"
+                
+                for frame_info in saved_frames:
+                    cloud_key = f"{cloud_selected_path}{frame_info['filename']}"
+                    self.s3_client.upload_file(
+                        frame_info['path'],
+                        self.bucket_name,
+                        cloud_key
+                    )
+                
+                # Upload information
+                cloud_info_key = f"{cloud_selected_path}adaptive_selection_info.json"
+                self.s3_client.put_object(
+                    Bucket=self.bucket_name,
+                    Key=cloud_info_key,
+                    Body=json.dumps(selection_info, ensure_ascii=False, indent=2).encode('utf-8'),
+                    ContentType='application/json'
+                )
+                
+                logger.info(f"Selected frames also uploaded to cloud: {cloud_selected_path}")
+                
+            except Exception as cloud_e:
+                logger.warning(f"Could not upload selected frames to cloud: {cloud_e}")
+            
+            logger.info(f"Saved {len(saved_frames)} optimized frames in {frames_dir}")
+            
+            return str(frames_dir)
+            
+        except Exception as e:
+            logger.error(f"Error saving frames: {e}")
+            return None
+
+    def send_qwen_request(self, question: str, selected_frames: List[Dict]) -> Optional[Dict]:
+        """Send request to Qwen2.5-VL with selected frames"""
+        
         models_to_try = [self.model_name] + self.backup_models
         
         for model_name in models_to_try:
             try:
-                logger.info(f"Запрос к {model_name} с {len(selected_frames)} ближайшими кадрами...")
+                logger.info(f"Trying multimodal model {model_name} with {len(selected_frames)} frames...")
                 
                 content = [
                     {
                         "type": "text",
-                        "text": f"""Answer the following multiple choice question about the video based on these frames selected as most relevant to the question:
+                        "text": f"""Answer the following multiple choice question about the video based on these key frames:
 
 {question}
 
-Analyze the frames carefully and choose the most appropriate answer. The frames are selected based on CLIP similarity to the question. Respond with ONLY the letter of the correct answer (A, B, C, D, or E). Do not provide any explanation or additional text."""
+Analyze the frames carefully and choose the most appropriate answer. The frames are selected to represent the most relevant visual content for this question. 
+
+Respond with ONLY the letter of the correct answer (A, B, C, D, or E). Do not provide any explanation or additional text."""
                     }
                 ]
                 
-                # Добавляем изображения
                 for i, frame in enumerate(selected_frames):
                     try:
-                        with open(frame['local_path'], 'rb') as f:
+                        with open(frame['path'], 'rb') as f:
                             import base64
                             image_data = base64.b64encode(f.read()).decode('utf-8')
                         
@@ -443,11 +920,11 @@ Analyze the frames carefully and choose the most appropriate answer. The frames 
                         
                         content.append({
                             "type": "text",
-                            "text": f"Frame {i+1}: t={frame['timestamp']:.1f}s (distance={frame['distance_to_question']:.3f})"
+                            "text": f"Frame {i+1}: timestamp {frame['timestamp']:.1f}s (cluster {frame['cluster_id']})"
                         })
                         
                     except Exception as e:
-                        logger.warning(f"Ошибка загрузки кадра {frame['filename']}: {e}")
+                        logger.warning(f"Error loading frame {frame['path']}: {e}")
                         continue
                 
                 payload = {
@@ -478,30 +955,51 @@ Analyze the frames carefully and choose the most appropriate answer. The frames 
                     if 'choices' in result and len(result['choices']) > 0:
                         choice = result['choices'][0]
                         
+                        response_text = choice['message']['content']
+                        logprobs_data = choice.get('logprobs', {})
+                        
+                        logger.info(f"Successful response from {model_name}")
+                        logger.info(f"Response text: {response_text}")
+                        
                         return {
-                            'response_text': choice['message']['content'],
-                            'logprobs': choice.get('logprobs', {}),
+                            'response_text': response_text,
+                            'logprobs': logprobs_data,
                             'model_used': model_name
                         }
+                    else:
+                        logger.error(f"Unexpected response format: {result}")
+                        continue
                 
                 elif response.status_code == 404:
-                    logger.warning(f"Модель {model_name} не найдена (404)")
+                    logger.warning(f"Model {model_name} not found (404)")
+                    continue
+                
+                elif response.status_code == 400:
+                    logger.warning(f"Request format error for {model_name}: {response.text}")
                     continue
                 
                 else:
-                    logger.warning(f"Ошибка {response.status_code} для {model_name}: {response.text}")
+                    logger.warning(f"Error {response.status_code} for {model_name}: {response.text}")
                     continue
                     
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout for {model_name}")
+                continue
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"HTTP error for {model_name}: {e}")
+                continue
             except Exception as e:
-                logger.warning(f"Ошибка для {model_name}: {e}")
+                logger.warning(f"Error for {model_name}: {e}")
                 continue
         
-        return None
-    
+        logger.error("All multimodal models not working")
+        raise Exception("api_request_failed: All models unavailable")
+
     def extract_answer_from_logprobs(self, result: Dict) -> Optional[str]:
-        """Извлечение ответа из logprobs токенов A, B, C, D, E"""
+        """Extract answer from logprobs of tokens A, B, C, D, E"""
         try:
             if not result or 'logprobs' not in result:
+                logger.warning("No logprobs data")
                 return None
                 
             logprobs_data = result['logprobs']
@@ -519,104 +1017,145 @@ Analyze the frames carefully and choose the most appropriate answer. The frames 
                         if token in self.answer_choices:
                             answer_logprobs[token] = logprob
                     
+                    logger.info(f"Logprobs for answer choices: {answer_logprobs}")
+                    
                     if answer_logprobs:
                         best_answer = max(answer_logprobs.items(), key=lambda x: x[1])[0]
-                        logger.info(f"Logprobs: {answer_logprobs}, выбран: {best_answer}")
+                        logger.info(f"Selected answer {best_answer} with logprob {answer_logprobs[best_answer]:.4f}")
                         return best_answer
-                
+                    
                 elif 'token' in content:
                     token = content['token'].strip().upper()
                     if token in self.answer_choices:
+                        logger.info(f"Direct answer: {token}")
                         return token
             
-            # Fallback
             response_text = result.get('response_text', '')
-            if response_text:
-                for choice in self.answer_choices:
-                    if choice in response_text.upper():
-                        return choice
+            fallback_answer = self.extract_answer_from_text(response_text)
             
+            if fallback_answer:
+                logger.info(f"Fallback answer from text: {fallback_answer}")
+                return fallback_answer
+            
+            logger.warning("Could not extract answer from logprobs")
             return None
             
         except Exception as e:
-            logger.error(f"Ошибка извлечения ответа из logprobs: {e}")
+            logger.error(f"Error extracting answer from logprobs: {e}")
+            
+            response_text = result.get('response_text', '') if result else ''
+            return self.extract_answer_from_text(response_text)
+
+    def extract_answer_from_text(self, response_text: str) -> Optional[str]:
+        """Fallback answer extraction from text"""
+        if not response_text:
             return None
-    
-    def process_single_video_simple(self, video_id: str, category: str) -> Dict:
-        """Простая обработка одного видео"""
+        
+        patterns = [
+            r'^([A-E])$',
+            r'^([A-E])\s*$',
+            r'([A-E])',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, response_text.strip().upper())
+            if match:
+                return match.group(1)
+        
+        return None
+
+    def process_single_video(self, video_id: str, category: str) -> Dict:
+        """Process single video with optimized frame retrieval"""
+        # Update attempt statistics
+        self.stats['attempted']['total_videos'] += 1
+        self.stats['attempted']['by_category'][category] += 1
+        
+        error_type = None
+        frames_cloud_path = None
+        
         try:
             logger.info(f"\n{'='*80}")
-            logger.info(f"ПРОСТАЯ ОБРАБОТКА: {video_id} ({category})")
+            logger.info(f"PROCESSING VIDEO: {video_id} ({category})")
             logger.info(f"{'='*80}")
             
-            # Получаем вопрос
+            # Get question
             key = (video_id, category)
             if key not in self.dataset_index:
-                raise Exception(f"Вопрос не найден для {video_id}")
+                raise Exception(f"Question not found for {video_id}")
             
             sample = self.dataset_index[key]
             conversations = sample['conversations']
             
             if not conversations or len(conversations) < 2:
-                raise Exception("Некорректный формат разговора")
+                raise Exception("Incorrect conversation format")
             
             question = conversations[0]['value']
             true_answer = conversations[1]['value']
-            
-            # Извлекаем правильный ответ
-            true_letter = None
-            for choice in self.answer_choices:
-                if choice in true_answer.upper():
-                    true_letter = choice
-                    break
+            true_letter = self.extract_answer_from_text(true_answer)
             
             if not true_letter:
-                raise Exception("Не удалось извлечь правильный ответ")
+                raise Exception("Could not extract correct answer")
             
-            logger.info(f"Вопрос: {question[:100]}...")
-            logger.info(f"Правильный ответ: {true_letter}")
+            logger.info(f"Question: {question[:100]}...")
+            logger.info(f"Correct answer: {true_letter}")
             
-            # Получаем эмбеддинг вопроса
-            question_embedding = self.get_question_embedding_cached(question)
+            # Get question embedding
+            question_embedding = self.get_question_embedding(question)
             if question_embedding is None:
-                raise Exception("Не удалось получить эмбеддинг вопроса")
+                raise Exception("Could not get question embedding")
             
-            # Загружаем кадры из облака
-            frames_data = self.load_frames_from_cloud(video_id, category)
-            if not frames_data:
-                raise Exception("Не удалось загрузить кадры")
+            # Get frames (from cloud or extract new)
+            try:
+                all_frames, frames_cloud_path = self.get_or_extract_frames(video_id)
+            except Exception as e:
+                if "download_failed" in str(e):
+                    error_type = "download_failed"
+                elif "frame_extraction_failed" in str(e):
+                    error_type = "frame_extraction_failed"
+                elif "cloud_upload_failed" in str(e):
+                    error_type = "cloud_upload_failed"
+                else:
+                    error_type = "other_errors"
+                raise e
             
-            # Получаем CLIP эмбеддинги для кадров
-            frames_with_embeddings = self.get_clip_embeddings_for_frames(frames_data)
-            if not frames_with_embeddings:
-                raise Exception("Не удалось получить эмбеддинги кадров")
+            # Adaptive frame selection
+            selected_frames = self.adaptive_frame_selection(all_frames, question_embedding, video_id)
             
-            # Выбираем ближайшие к вопросу кадры
-            selected_frames = self.select_closest_frames_to_question(frames_with_embeddings, question_embedding)
             if not selected_frames:
-                raise Exception("Не удалось выбрать кадры")
+                error_type = "frame_extraction_failed"
+                raise Exception("Could not select frames")
             
-            # Отправляем запрос к Qwen с logprobs
-            result = self.send_qwen_request_with_logprobs(question, selected_frames)
-            if not result:
-                raise Exception("Нет ответа от Qwen")
+            # Save selected frames
+            frames_dir = self.save_selected_frames(selected_frames, video_id)
             
-            # Извлекаем ответ из logprobs
-            predicted_letter = self.extract_answer_from_logprobs(result)
-            if not predicted_letter:
-                raise Exception("Не удалось извлечь ответ модели")
+            # Send request to Qwen with logprobs
+            try:
+                result = self.send_qwen_request(question, selected_frames)
+            except Exception as e:
+                error_type = "api_request_failed"
+                raise e
             
-            # Результат
+            # Extract answer from logprobs
+            try:
+                predicted_letter = self.extract_answer_from_logprobs(result)
+                
+                if not predicted_letter:
+                    error_type = "answer_extraction_failed"
+                    raise Exception("Could not extract model answer")
+            except Exception as e:
+                error_type = "answer_extraction_failed"
+                raise e
+            
+            # SUCCESSFUL PROCESSING
             is_correct = predicted_letter == true_letter
             
-            # Обновляем статистику
-            self.stats['videos_processed'] += 1
-            self.stats['total_questions'] += 1
-            self.stats['by_category'][category]['total'] += 1
+            # Update successfully processed statistics
+            self.stats['successfully_processed']['total_videos'] += 1
+            self.stats['successfully_processed']['by_category'][category]['total'] += 1
             
             if is_correct:
-                self.stats['correct_answers'] += 1
-                self.stats['by_category'][category]['correct'] += 1
+                self.stats['successfully_processed']['correct_answers'] += 1
+                self.stats['successfully_processed']['by_category'][category]['correct'] += 1
             
             final_result = {
                 'video_id': video_id,
@@ -628,15 +1167,16 @@ Analyze the frames carefully and choose the most appropriate answer. The frames 
                 'qwen_response': result['response_text'],
                 'qwen_logprobs': result['logprobs'],
                 'model_used': result['model_used'],
-                'total_frames_available': len(frames_data),
-                'frames_with_embeddings': len(frames_with_embeddings),
+                'total_frames': len(all_frames),
                 'selected_frames': len(selected_frames),
-                'selection_method': 'closest_to_question_clip_similarity',
+                'frames_dir': frames_dir,
+                'frames_cloud_path': frames_cloud_path,
+                'status': 'success',
                 'selection_details': [
                     {
                         'order': int(f['selection_order']),
-                        'filename': f['filename'],
-                        'frame_number': int(f['frame_number']),
+                        'cluster': int(f['cluster_id']),
+                        'frame_num': int(f['frame_number']),
                         'timestamp': float(f['timestamp']),
                         'distance_to_question': float(f['distance_to_question'])
                     }
@@ -644,40 +1184,61 @@ Analyze the frames carefully and choose the most appropriate answer. The frames 
                 ]
             }
             
-            logger.info(f"РЕЗУЛЬТАТ: {predicted_letter} vs {true_letter} {'CORRECT' if is_correct else 'WRONG'}")
-            logger.info(f"Использовано {len(selected_frames)} кадров из {len(frames_data)} доступных")
+            logger.info(f"SUCCESS: {predicted_letter} vs {true_letter} {'CORRECT' if is_correct else 'WRONG'}")
+            logger.info(f"Selected {len(selected_frames)} frames from {len(all_frames)}")
+            logger.info(f"Frames saved in cloud: {frames_cloud_path}")
             
-            # Очищаем временные файлы
-            import shutil
-            temp_frames_dir = Path('temp_frames_simple') / video_id
-            if temp_frames_dir.exists():
-                shutil.rmtree(temp_frames_dir)
+            # Clean up temporary files
+            try:
+                import shutil
+                temp_frames_dir = Path('temp_frames') / video_id
+                if temp_frames_dir.exists():
+                    shutil.rmtree(temp_frames_dir)
+                
+                downloaded_frames_dir = Path('downloaded_frames') / video_id
+                if downloaded_frames_dir.exists():
+                    shutil.rmtree(downloaded_frames_dir)
+                    
+            except Exception as cleanup_error:
+                logger.warning(f"Cleanup error: {cleanup_error}")
             
             return final_result
             
         except Exception as e:
-            logger.error(f"Ошибка обработки видео {video_id}: {e}")
-            self.stats['errors'] += 1
+            logger.error(f"ERROR processing video {video_id}: {e}")
             
-            # Очищаем временные файлы при ошибке
-            import shutil
-            temp_frames_dir = Path('temp_frames_simple') / video_id
-            if temp_frames_dir.exists():
-                shutil.rmtree(temp_frames_dir)
+            # Classify error
+            if error_type is None:
+                if "download_failed" in str(e):
+                    error_type = "download_failed"
+                elif "frame_extraction_failed" in str(e):
+                    error_type = "frame_extraction_failed"
+                elif "api_request_failed" in str(e):
+                    error_type = "api_request_failed"
+                elif "answer_extraction_failed" in str(e):
+                    error_type = "answer_extraction_failed"
+                elif "cloud_upload_failed" in str(e):
+                    error_type = "cloud_upload_failed"
+                else:
+                    error_type = "other_errors"
+            
+            # Update error statistics
+            self.stats['errors'][error_type] += 1
+            self.stats['errors']['by_category'][category][error_type] += 1
             
             return {
                 'video_id': video_id,
                 'category': category,
                 'error': str(e),
-                'is_correct': False
+                'error_type': error_type,
+                'frames_cloud_path': frames_cloud_path,
+                'status': 'failed'
             }
-    
-    def run_simple_full_evaluation(self, max_videos_per_category: int = None):
-        """Запуск полной простой оценки на всех видео"""
-        logger.info(f"\nПОЛНАЯ ПРОСТАЯ ОЦЕНКА")
-        logger.info(f"Подход: кадры из облака → CLIP эмбеддинги → ближайшие к вопросу → Qwen")
+
+    def run_full_evaluation(self, max_videos_per_category: int = None):
+        """Run full evaluation on all videos"""
+        logger.info(f"\nOPTIMIZED EVALUATION WITH FIXED CLOUD STORAGE")
         
-        # Подсчитываем общее количество видео
         total_videos = 0
         for category, videos in self.available_videos.items():
             if max_videos_per_category:
@@ -685,20 +1246,24 @@ Analyze the frames carefully and choose the most appropriate answer. The frames 
             else:
                 total_videos += len(videos)
         
-        logger.info(f"ПЛАНИРУЕМАЯ ПРОСТАЯ ОЦЕНКА:")
-        logger.info(f"  Всего видео: {total_videos}")
-        logger.info(f"  Кадров на видео: {self.max_frames}")
-        logger.info(f"  Примерное время: ~{total_videos * 1.5 / 60:.1f} часов")
+        estimated_time_hours = total_videos * 1.2 / 60
+        estimated_cost = total_videos * 0.05
         
-        confirm = input("\nЗапустить простую полную оценку? (y/N): ")
+        logger.info(f"EXPERIMENT ESTIMATE:")
+        logger.info(f"Total videos: {total_videos}")
+        logger.info(f"Time: ~{estimated_time_hours:.1f} hours (forced extraction of all frames)")
+        logger.info(f"Cost: ~${estimated_cost:.2f}")
+        logger.info(f"Frames will be saved in cloud: {self.cloud_frames_prefix}")
+        logger.info(f"Selected frames: {self.cloud_selected_prefix}")
+        logger.info(f"MODE: Forced extraction of new frames for ALL videos")
+        
+        confirm = input("\nStart forced frame extraction for all videos? (y/N): ")
         if confirm.lower() != 'y':
-            logger.info("Отменено пользователем")
+            logger.info("Cancelled by user")
             return
         
-        # Результаты
         all_results = []
         
-        # Обрабатываем категории
         for category in self.categories:
             if category not in self.available_videos:
                 continue
@@ -707,161 +1272,282 @@ Analyze the frames carefully and choose the most appropriate answer. The frames 
             if max_videos_per_category:
                 videos = videos[:max_videos_per_category]
             
-            logger.info(f"\nПРОСТАЯ ОБРАБОТКА КАТЕГОРИИ: {category} ({len(videos)} видео)")
+            logger.info(f"\nCATEGORY: {category} ({len(videos)} videos)")
             
-            # Обрабатываем видео в категории
-            for i, video_id in enumerate(tqdm(videos, desc=f"Simple {category}")):
-                logger.info(f"\nВидео {i+1}/{len(videos)}: {video_id}")
+            for i, video_id in enumerate(tqdm(videos, desc=f"Processing {category}")):
+                logger.info(f"\nVideo {i+1}/{len(videos)}: {video_id}")
                 
-                result = self.process_single_video_simple(video_id, category)
+                result = self.process_single_video(video_id, category)
                 all_results.append(result)
                 
-                # Показываем промежуточную статистику
                 if (i + 1) % 5 == 0:
-                    current_accuracy = (self.stats['correct_answers'] / self.stats['total_questions'] * 100) if self.stats['total_questions'] > 0 else 0
-                    logger.info(f"Промежуточная точность: {self.stats['correct_answers']}/{self.stats['total_questions']} ({current_accuracy:.1f}%)")
-                    logger.info(f"Кадров обработано: {self.stats['frames_processed']}")
+                    processed = self.stats['successfully_processed']['total_videos']
+                    correct = self.stats['successfully_processed']['correct_answers']
+                    attempted = self.stats['attempted']['total_videos']
+                    total_extractions = self.stats['frame_extraction']['total_extractions']
+                    successful_uploads = self.stats['frame_extraction']['successful_uploads']
+                    partial_uploads = self.stats['frame_extraction']['partial_uploads']
+                    failed_uploads = self.stats['frame_extraction']['failed_uploads']
+                    total_frames = self.stats['frame_extraction']['total_frames_extracted']
+                    
+                    accuracy = (correct / processed * 100) if processed > 0 else 0
+                    success_rate = (processed / attempted * 100) if attempted > 0 else 0
+                    
+                    logger.info(f"Intermediate statistics:")
+                    logger.info(f"  Attempts: {attempted}")
+                    logger.info(f"  Successfully processed: {processed} ({success_rate:.1f}%)")
+                    logger.info(f"  Correct answers: {correct}/{processed} ({accuracy:.1f}%)")
+                    logger.info(f"  Extractions: {total_extractions}, frames: {total_frames}")
+                    logger.info(f"  Cloud: successful {successful_uploads}, partial {partial_uploads}, errors {failed_uploads}")
                 
-                # Пауза
-                time.sleep(0.5)
+                time.sleep(1)
         
-        # Финальные результаты
-        self._show_simple_final_results(all_results)
-        
-        # Сохраняем результаты
-        self._save_simple_results(all_results)
+        self._show_final_results(all_results)
+        self._save_results(all_results)
         
         return all_results
-    
-    def _show_simple_final_results(self, all_results: List[Dict]):
-        """Показ финальных результатов простой оценки"""
+
+    def _show_final_results(self, all_results: List[Dict]):
+        """Show final results with optimization information"""
         total_time = datetime.now() - self.stats['start_time']
-        overall_accuracy = (self.stats['correct_answers'] / self.stats['total_questions'] * 100) if self.stats['total_questions'] > 0 else 0
+        
+        attempted = self.stats['attempted']['total_videos']
+        processed = self.stats['successfully_processed']['total_videos']
+        correct = self.stats['successfully_processed']['correct_answers']
+        
+        total_extractions = self.stats['frame_extraction']['total_extractions']
+        successful_uploads = self.stats['frame_extraction']['successful_uploads']
+        partial_uploads = self.stats['frame_extraction']['partial_uploads']
+        failed_uploads = self.stats['frame_extraction']['failed_uploads']
+        total_frames = self.stats['frame_extraction']['total_frames_extracted']
+        
+        success_rate = (processed / attempted * 100) if attempted > 0 else 0
+        accuracy = (correct / processed * 100) if processed > 0 else 0
+        cloud_success_rate = (successful_uploads / (successful_uploads + partial_uploads + failed_uploads) * 100) if (successful_uploads + partial_uploads + failed_uploads) > 0 else 0
+        avg_frames_per_video = (total_frames / total_extractions) if total_extractions > 0 else 0
+        
+        total_errors = sum(self.stats['errors'][error_type] for error_type in ['download_failed', 'frame_extraction_failed', 'api_request_failed', 'answer_extraction_failed', 'cloud_upload_failed', 'other_errors'])
         
         logger.info(f"\n{'='*80}")
-        logger.info("ФИНАЛЬНЫЕ РЕЗУЛЬТАТЫ ПРОСТОЙ ОЦЕНКИ")
+        logger.info("FINAL RESULTS OF OPTIMIZED EVALUATION WITH FIXES")
         logger.info(f"{'='*80}")
-        logger.info(f"Время обработки: {total_time}")
-        logger.info(f"Видео обработано: {self.stats['videos_processed']}")
-        logger.info(f"Вопросов: {self.stats['total_questions']}")
-        logger.info(f"Правильных ответов: {self.stats['correct_answers']}")
-        logger.info(f"ИТОГОВАЯ ACCURACY: {overall_accuracy:.2f}%")
-        logger.info(f"Ошибок: {self.stats['errors']}")
-        logger.info(f"Кадров обработано: {self.stats['frames_processed']}")
+        logger.info(f"Execution time: {total_time}")
+        logger.info(f"")
+        logger.info(f"PROCESSING STATISTICS:")
+        logger.info(f"  Processing attempts: {attempted}")
+        logger.info(f"  Successfully processed: {processed} ({success_rate:.1f}%)")
+        logger.info(f"  Total errors: {total_errors}")
+        logger.info(f"")
+        logger.info(f"ACCURACY (only successfully processed):")
+        logger.info(f"  Correct answers: {correct}/{processed}")
+        logger.info(f"  Accuracy: {accuracy:.2f}%")
+        logger.info(f"")
+        logger.info(f"FRAME OPTIMIZATION:")
+        logger.info(f"  Total extractions: {total_extractions}")
+        logger.info(f"  Total frames extracted: {total_frames}")
+        logger.info(f"  Average frames per video: {avg_frames_per_video:.1f}")
+        logger.info(f"")
+        logger.info(f"CLOUD STATISTICS:")
+        logger.info(f"  Successfully uploaded: {successful_uploads}")
+        logger.info(f"  Partially uploaded: {partial_uploads}")
+        logger.info(f"  Upload errors: {failed_uploads}")
+        logger.info(f"  Cloud success rate: {cloud_success_rate:.1f}%")
+        logger.info(f"")
+        logger.info(f"CLOUD PATHS:")
+        logger.info(f"  All frames: {self.cloud_frames_prefix}")
+        logger.info(f"  Selected frames: {self.cloud_selected_prefix}")
         
-        logger.info(f"\nРЕЗУЛЬТАТЫ ПО КАТЕГОРИЯМ:")
-        logger.info(f"{'Категория':<25} {'Правильных':<12} {'Всего':<8} {'Accuracy':<10}")
-        logger.info("-" * 60)
+        logger.info(f"\nERRORS BY TYPE:")
+        logger.info(f"  Download: {self.stats['errors']['download_failed']}")
+        logger.info(f"  Frame extraction: {self.stats['errors']['frame_extraction_failed']}")
+        logger.info(f"  API requests: {self.stats['errors']['api_request_failed']}")
+        logger.info(f"  Answer extraction: {self.stats['errors']['answer_extraction_failed']}")
+        logger.info(f"  Cloud upload: {self.stats['errors']['cloud_upload_failed']}")
+        logger.info(f"  Other: {self.stats['errors']['other_errors']}")
+        
+        logger.info(f"\nRESULTS BY CATEGORY:")
+        logger.info(f"{'Category':<25} {'Attempts':<8} {'Success':<8} {'Correct':<10} {'Accuracy':<10}")
+        logger.info("-" * 70)
         
         for category in self.categories:
-            if category in self.stats['by_category']:
-                stats = self.stats['by_category'][category]
-                if stats['total'] > 0:
-                    acc = (stats['correct'] / stats['total'] * 100)
-                    logger.info(f"{category:<25} {stats['correct']:<12} {stats['total']:<8} {acc:>7.1f}%")
-    
-    def _save_simple_results(self, all_results: List[Dict]):
-        """Сохранение результатов простой оценки"""
+            attempted_cat = self.stats['attempted']['by_category'][category]
+            if attempted_cat > 0:
+                processed_cat = self.stats['successfully_processed']['by_category'][category]['total']
+                correct_cat = self.stats['successfully_processed']['by_category'][category]['correct']
+                
+                acc = (correct_cat / processed_cat * 100) if processed_cat > 0 else 0
+                
+                logger.info(f"{category:<25} {attempted_cat:<8} {processed_cat:<8} {correct_cat:<10} {acc:>7.1f}%")
+
+    def _save_results(self, all_results: List[Dict]):
+        """Save results with optimization information"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         
-        # Подробные результаты
-        results_file = Path('simple_results') / f"simple_evaluation_{timestamp}.json"
+        results_file = Path('adaptive_results') / f"fixed_optimized_evaluation_{timestamp}.json"
+        
+        attempted = self.stats['attempted']['total_videos']
+        processed = self.stats['successfully_processed']['total_videos']
+        correct = self.stats['successfully_processed']['correct_answers']
         
         final_results = {
             'experiment_info': {
-                'method': 'simple_frames_from_cloud_clip_similarity',
+                'method': 'fixed_optimized_adaptive_clustering_with_cloud_storage',
                 'model': self.model_name,
                 'max_frames': self.max_frames,
-                'selection_method': 'closest_to_question_clip_similarity',
+                'frame_interval': self.frame_interval,
                 'answer_extraction_method': 'logprobs',
                 'timestamp': datetime.now().isoformat(),
-                'total_time': str(datetime.now() - self.stats['start_time'])
+                'total_time': str(datetime.now() - self.stats['start_time']),
+                'cloud_frames_path': self.cloud_frames_prefix,
+                'cloud_selected_path': self.cloud_selected_prefix,
+                'fixes_applied': [
+                    'safe_file_names',
+                    'retry_mechanism',
+                    'fallback_to_local',
+                    'improved_error_handling',
+                    'progress_reporting'
+                ]
             },
-            'overall_stats': {
-                'videos_processed': self.stats['videos_processed'],
-                'total_questions': self.stats['total_questions'],
-                'correct_answers': self.stats['correct_answers'],
-                'accuracy': (self.stats['correct_answers'] / self.stats['total_questions'] * 100) if self.stats['total_questions'] > 0 else 0,
-                'errors': self.stats['errors'],
-                'frames_processed': self.stats['frames_processed']
+            'processing_stats': {
+                'attempted_videos': attempted,
+                'successfully_processed': processed,
+                'success_rate_percent': (processed / attempted * 100) if attempted > 0 else 0,
+                'total_errors': attempted - processed
             },
-            'results_by_category': dict(self.stats['by_category']),
+            'accuracy_stats': {
+                'correct_answers': correct,
+                'total_processed': processed,
+                'accuracy_percent': (correct / processed * 100) if processed > 0 else 0
+            },
+            'frame_extraction_stats': dict(self.stats['frame_extraction']),
+            'error_breakdown': dict(self.stats['errors']),
+            'results_by_category': {
+                category: {
+                    'attempted': self.stats['attempted']['by_category'][category],
+                    'successfully_processed': self.stats['successfully_processed']['by_category'][category]['total'],
+                    'correct_answers': self.stats['successfully_processed']['by_category'][category]['correct'],
+                    'accuracy_percent': (
+                        self.stats['successfully_processed']['by_category'][category]['correct'] / 
+                        self.stats['successfully_processed']['by_category'][category]['total'] * 100
+                    ) if self.stats['successfully_processed']['by_category'][category]['total'] > 0 else 0
+                }
+                for category in self.categories 
+                if self.stats['attempted']['by_category'][category] > 0
+            },
             'detailed_results': all_results
         }
         
         with open(results_file, 'w', encoding='utf-8') as f:
             json.dump(final_results, f, ensure_ascii=False, indent=2)
         
-        logger.info(f"Результаты сохранены: {results_file}")
+        logger.info(f"Results saved: {results_file}")
         
-        # Краткая сводка
-        summary_file = Path('simple_results') / f"simple_summary_{timestamp}.txt"
+        # Brief summary
+        summary_file = Path('adaptive_results') / f"fixed_optimized_summary_{timestamp}.txt"
         with open(summary_file, 'w', encoding='utf-8') as f:
-            f.write("ПРОСТАЯ ОЦЕНКА ФРЕЙМОВ - СВОДКА РЕЗУЛЬТАТОВ\n")
-            f.write("=" * 50 + "\n\n")
-            f.write(f"ИТОГОВАЯ ACCURACY: {final_results['overall_stats']['accuracy']:.2f}%\n")
-            f.write(f"Обработано видео: {final_results['overall_stats']['videos_processed']}\n")
-            f.write(f"Правильных ответов: {final_results['overall_stats']['correct_answers']}\n")
-            f.write(f"Всего вопросов: {final_results['overall_stats']['total_questions']}\n")
-            f.write(f"Кадров обработано: {final_results['overall_stats']['frames_processed']}\n\n")
+            f.write("FIXED OPTIMIZED ADAPTIVE FRAME SELECTION\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"PROCESSING:\n")
+            f.write(f"  Attempts: {attempted}\n")
+            f.write(f"  Successful: {processed} ({processed/attempted*100:.1f}%)\n")
+            f.write(f"  Errors: {attempted - processed}\n\n")
+            f.write(f"ACCURACY (only successfully processed):\n")
+            f.write(f"  Correct: {correct}/{processed}\n")
+            f.write(f"  Accuracy: {correct/processed*100:.2f}%\n\n")
+            f.write(f"FRAME EXTRACTION:\n")
+            f.write(f"  Total extractions: {self.stats['frame_extraction']['total_extractions']}\n")
+            f.write(f"  Total frames: {self.stats['frame_extraction']['total_frames_extracted']}\n")
+            f.write(f"  Successful uploads: {self.stats['frame_extraction']['successful_uploads']}\n")
+            f.write(f"  Partial uploads: {self.stats['frame_extraction']['partial_uploads']}\n")
+            f.write(f"  Upload errors: {self.stats['frame_extraction']['failed_uploads']}\n\n")
+            f.write(f"FIXES APPLIED:\n")
+            f.write(f"  Safe file names\n")
+            f.write(f"  Retry mechanism (3 attempts)\n")  
+            f.write(f"  Fallback to local storage\n")
+            f.write(f"  Improved error handling\n")
+            f.write(f"  Detailed progress logging\n\n")
+            f.write(f"CLOUD PATHS:\n")
+            f.write(f"  All frames: {self.cloud_frames_prefix}\n")
+            f.write(f"  Selected frames: {self.cloud_selected_prefix}\n\n")
             
-            f.write("МЕТОД: Кадры из облака → CLIP эмбеддинги → ближайшие к вопросу\n\n")
-            
-            f.write("Результаты по категориям:\n")
+            f.write("Results by category:\n")
             for category in self.categories:
-                if category in self.stats['by_category']:
-                    stats = self.stats['by_category'][category]
-                    if stats['total'] > 0:
-                        acc = (stats['correct'] / stats['total'] * 100)
-                        f.write(f"{category}: {stats['correct']}/{stats['total']} ({acc:.1f}%)\n")
+                if self.stats['attempted']['by_category'][category] > 0:
+                    att = self.stats['attempted']['by_category'][category]
+                    proc = self.stats['successfully_processed']['by_category'][category]['total']
+                    corr = self.stats['successfully_processed']['by_category'][category]['correct']
+                    acc = (corr / proc * 100) if proc > 0 else 0
+                    f.write(f"{category}: {att} attempts -> {proc} successful -> {corr} correct ({acc:.1f}%)\n")
         
-        logger.info(f"Сводка сохранена: {summary_file}")
+        logger.info(f"Summary saved: {summary_file}")
 
 def main():
-    """Главная функция"""
-    print("ПРОСТОЙ И ЭФФЕКТИВНЫЙ СЕЛЕКТОР ФРЕЙМОВ")
-    print("=" * 50)
+    """Main function"""
+    print("FIXED OPTIMIZED ADAPTIVE SELECTION WITH CLOUD STORAGE")
+    print("=" * 70)
     
     try:
-        selector = SimpleFrameSelector()
+        selector = OptimizedFrameSelector()
         
-        # Показываем статистику видео
-        print(f"\nДОСТУПНЫЕ ОБРАБОТАННЫЕ ВИДЕО:")
+        print(f"\nAVAILABLE VIDEOS:")
         for category, videos in selector.available_videos.items():
-            print(f"  {category}: {len(videos)} видео")
+            print(f"   {category}: {len(videos)} videos")
         
-        total_videos = sum(len(videos) for videos in selector.available_videos.values())
-        print(f"\nВсего видео: {total_videos}")
+        print(f"\nUsing model: {selector.model_name}")
+        print(f"Answer extraction method: logprobs of tokens A, B, C, D, E")
+        print(f"\nFIXES APPLIED:")
+        print(f"Safe file names (removed dashes and special chars)")
+        print(f"Retry mechanism (3 attempts per file)")
+        print(f"Fallback to local storage if cloud unavailable")
+        print(f"Improved error handling")
+        print(f"Detailed progress logging every 100 frames")
+        print(f"\nOPTIMIZATIONS:")
+        print(f"Frames saved in cloud: {selector.cloud_frames_prefix}")
+        print(f"Reuse of already extracted frames")
+        print(f"Acceleration of repeated experiments")
+        print(f"Selected frames also in cloud: {selector.cloud_selected_prefix}")
         
-        print(f"\nПРОСТОЙ ПОДХОД:")
-        print("• Загружаем кадры из облака как изображения")
-        print("• Получаем CLIP эмбеддинги заново для точности")
-        print("• Ищем ближайшие к вопросу по cosine similarity")
-        print("• Отправляем в Qwen с logprobs")
-        print("• Никаких сложных кластеризаций!")
+        print("\nRun options:")
+        print("1. Full evaluation on all videos")
+        print("2. Test evaluation (3 videos per category)")
+        print("3. One category completely")
         
-        print(f"\nВарианты запуска:")
-        print("1. Полная простая оценка на всех видео")
-        print("2. Ограниченная оценка (по N видео на категорию)")
-        
-        choice = input("\nВыберите вариант (1-2): ").strip()
+        choice = input("\nSelect option (1-3): ").strip()
         
         if choice == '1':
-            results = selector.run_simple_full_evaluation()
+            results = selector.run_full_evaluation()
         elif choice == '2':
-            n = int(input("Сколько видео на категорию? "))
-            results = selector.run_simple_full_evaluation(max_videos_per_category=n)
+            results = selector.run_full_evaluation(max_videos_per_category=3)
+        elif choice == '3':
+            print("\nAvailable categories:")
+            for i, category in enumerate(selector.categories, 1):
+                print(f"{i}. {category}")
+            
+            cat_choice = input("Select category (1-10): ").strip()
+            try:
+                cat_idx = int(cat_choice) - 1
+                if 0 <= cat_idx < len(selector.categories):
+                    category = selector.categories[cat_idx]
+                    selector.categories = [category]
+                    results = selector.run_full_evaluation()
+                else:
+                    print("Invalid choice")
+            except ValueError:
+                print("Invalid input")
         else:
-            print("Неверный выбор")
+            print("Invalid choice")
             return
         
-        print("\nПРОСТАЯ ОЦЕНКА ЗАВЕРШЕНА!")
-        print("Результаты сохранены в папке simple_results/")
+        print("\nEvaluation completed!")
+        print("Results saved in adaptive_results/ folder")
+        print("Local selected frames in selected_frames_adaptive/ folder")
+        print(f"All frames in cloud: {selector.cloud_frames_prefix}")
+        print(f"Selected frames in cloud: {selector.cloud_selected_prefix}")
         
     except KeyboardInterrupt:
-        print("\nПрервано пользователем")
+        print("\nInterrupted by user")
     except Exception as e:
-        print(f"\nОшибка: {e}")
+        print(f"\nError: {e}")
 
 if __name__ == "__main__":
     main()
