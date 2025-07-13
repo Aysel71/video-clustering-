@@ -1,0 +1,1754 @@
+#!/usr/bin/env python3
+"""
+OPTIMIZED ADAPTIVE CLUSTERING WITH HYPERPARAMETERS
+=================================================
+
+Optimized version with improvements:
+1. Caching embeddings and results
+2. Batch processing
+3. Memory optimization
+4. Asynchronous processing
+5. Profiling
+"""
+
+import os
+import json
+import logging
+import cv2
+import boto3
+import yt_dlp
+import torch
+import clip
+import random
+import numpy as np
+import requests
+import time
+import re
+import hashlib
+import psutil
+# Remove threading for Apple Silicon compatibility
+from functools import lru_cache, wraps
+from contextlib import contextmanager
+from PIL import Image
+from pathlib import Path
+from datetime import datetime
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering, SpectralClustering
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+from sklearn.metrics.pairwise import cosine_distances
+from datasets import load_dataset
+from collections import defaultdict, deque
+from typing import List, Dict, Tuple, Optional, Any, Iterator
+from dataclasses import dataclass, asdict
+from tqdm import tqdm
+import warnings
+import gc
+warnings.filterwarnings('ignore')
+
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+# ==================== CONFIGURATION ====================
+
+@dataclass
+class SystemConfig:
+    """System configuration (Apple Silicon compatible)"""
+    # API settings
+    api_key: str = "key"
+    api_url: str = "https://api.fireworks.ai/inference/v1/chat/completions"
+    primary_model: str = "fireworks/qwen2p5-vl-32b-instruct"
+    backup_models: List[str] = None
+    
+    # Performance settings (optimized for Apple Silicon)
+    max_workers: int = 1           # Remove multithreading for stability
+    batch_size: int = 2           # Smaller for memory saving
+    cache_size: int = 32          # Smaller cache
+    max_image_size: int = 768     # Smaller size for MPS
+    jpeg_quality: int = 75        # Lower quality
+    
+    # Memory management (conservative settings)
+    max_memory_usage: float = 60.0  # percent
+    gc_frequency: int = 5           # videos (more frequent cleanup)
+    
+    # Retry settings
+    max_retries: int = 2
+    retry_delay: float = 0.5
+    
+    # Tuning settings (reduced for stability)
+    max_tuning_combinations: int = 6
+    max_tuning_samples: int = 2
+    early_stopping_patience: int = 2
+    
+    # Apple Silicon specific
+    use_mps_optimization: bool = True
+    disable_threading: bool = True  # Disable threading for stability
+    
+    def __post_init__(self):
+        if self.backup_models is None:
+            self.backup_models = [
+                "fireworks/qwen2-vl-7b-instruct",
+                "fireworks/llava-v1p6-34b-instruct"
+            ]
+
+@dataclass
+class ClusteringConfig:
+    """Optimized clustering configuration with validation"""
+    method: str = "kmeans"
+    max_frames: int = 8
+    frame_interval: int = 16
+    min_clusters: int = 2
+    max_clusters: int = 6
+    
+    # Metrics and weights
+    primary_metric: str = "silhouette"
+    metric_weights: Dict[str, float] = None
+    
+    # Method parameters
+    # KMeans
+    kmeans_init: str = "k-means++"
+    kmeans_n_init: int = 10
+    
+    # DBSCAN
+    dbscan_eps: float = 0.3
+    dbscan_min_samples: int = 2
+    
+    # AgglomerativeClustering
+    agglomerative_linkage: str = "average"
+    agglomerative_affinity: str = "euclidean"
+    
+    # SpectralClustering
+    spectral_affinity: str = "rbf"
+    spectral_gamma: float = 1.0
+    
+    def __post_init__(self):
+        if self.metric_weights is None:
+            self.metric_weights = {"silhouette": 0.4, "calinski": 0.3, "davies": 0.3}
+        
+        # Validation and correction of incompatible parameters for agglomerative
+        if self.method == "agglomerative":
+            if self.agglomerative_linkage == "ward" and self.agglomerative_affinity != "euclidean":
+                logging.warning(f"Ward linkage requires euclidean affinity, fixing")
+                self.agglomerative_affinity = "euclidean"
+            elif self.agglomerative_affinity == "cosine" and self.agglomerative_linkage == "ward":
+                logging.warning(f"Cosine affinity not compatible with Ward, fixing")
+                self.agglomerative_linkage = "average"
+    
+    @property
+    def params(self) -> Dict[str, Any]:
+        """Get parameters for specific method"""
+        if self.method == "kmeans":
+            return {
+                "init": self.kmeans_init,
+                "n_init": self.kmeans_n_init
+            }
+        elif self.method == "dbscan":
+            return {
+                "eps": self.dbscan_eps,
+                "min_samples": self.dbscan_min_samples
+            }
+        elif self.method == "agglomerative":
+            return {
+                "linkage": self.agglomerative_linkage,
+                "affinity": self.agglomerative_affinity
+            }
+        elif self.method == "spectral":
+            return {
+                "affinity": self.spectral_affinity,
+                "gamma": self.spectral_gamma
+            }
+        else:
+            return {}
+
+# ==================== CACHING & UTILITIES ====================
+
+class MemoryMonitor:
+    """Memory monitoring"""
+    
+    @staticmethod
+    def get_memory_usage() -> float:
+        return psutil.virtual_memory().percent
+    
+    @staticmethod
+    def force_gc():
+        """Force memory cleanup"""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    @staticmethod
+    def check_memory_limit(limit: float = 80.0) -> bool:
+        return MemoryMonitor.get_memory_usage() > limit
+
+def retry_with_backoff(max_retries: int = 3, delay: float = 1.0):
+    """Decorator for retry with exponential backoff"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        sleep_time = delay * (2 ** attempt) + random.uniform(0, 1)
+                        time.sleep(sleep_time)
+                    continue
+            raise last_exception
+        return wrapper
+    return decorator
+
+@contextmanager
+def memory_cleanup():
+    """Context manager for memory cleanup"""
+    try:
+        yield
+    finally:
+        MemoryMonitor.force_gc()
+
+class EmbeddingCache:
+    """Cache for embeddings with auto-cleanup"""
+    
+    def __init__(self, max_size: int = 1000):
+        self.cache = {}
+        self.access_times = deque()
+        self.max_size = max_size
+    
+    def _get_key(self, data: Any) -> str:
+        """Create cache key"""
+        if isinstance(data, str):
+            return hashlib.md5(data.encode()).hexdigest()
+        elif hasattr(data, 'tobytes'):
+            return hashlib.md5(data.tobytes()).hexdigest()
+        else:
+            return hashlib.md5(str(data).encode()).hexdigest()
+    
+    def get(self, key: str) -> Optional[np.ndarray]:
+        if key in self.cache:
+            self.access_times.append((key, time.time()))
+            return self.cache[key].copy()
+        return None
+    
+    def put(self, key: str, value: np.ndarray):
+        if len(self.cache) >= self.max_size:
+            self._evict_oldest()
+        
+        self.cache[key] = value.copy()
+        self.access_times.append((key, time.time()))
+    
+    def _evict_oldest(self):
+        """Remove old entries"""
+        if self.access_times:
+            oldest_key, _ = self.access_times.popleft()
+            self.cache.pop(oldest_key, None)
+
+# ==================== OPTIMIZED CLASSES ====================
+
+class OptimizedHyperparameterTuner:
+    """Optimized hyperparameter tuner"""
+    
+    def __init__(self, config: SystemConfig):
+        self.config = config
+        self.category_configs = {}
+        self.tuning_results = {}
+        self.embedding_cache = EmbeddingCache(config.cache_size)
+        
+        # Optimized search space
+        self.param_space = self._create_param_space()
+        self.category_specs = self._create_category_specs()
+        
+        self.load_category_configs()
+    
+    def _create_param_space(self) -> Dict[str, Dict[str, List[Any]]]:
+        """Create valid search space with compatibility checking"""
+        return {
+            'kmeans': {
+                'max_frames': [6, 8, 10, 12],
+                'frame_interval': [12, 16, 20],
+                'min_clusters': [2, 3],
+                'max_clusters': [4, 5, 6]
+            },
+            'dbscan': {
+                'max_frames': [8, 10, 12],
+                'frame_interval': [12, 16, 20],
+                'dbscan_eps': [0.2, 0.3, 0.4],
+                'dbscan_min_samples': [2, 3]
+            },
+            'agglomerative': {
+                'max_frames': [6, 8, 10],
+                'frame_interval': [12, 16, 20],
+                'min_clusters': [2, 3],
+                'max_clusters': [4, 5, 6],
+                # Valid combinations of linkage + affinity
+                'agglomerative_linkage': ['ward', 'complete', 'average'],
+                'agglomerative_affinity': ['euclidean', 'cosine']
+            },
+            'spectral': {
+                'max_frames': [6, 8, 10],
+                'frame_interval': [16, 20],
+                'min_clusters': [2, 3],
+                'max_clusters': [4, 5],
+                'spectral_affinity': ['rbf', 'nearest_neighbors']
+            }
+        }
+    
+    def _create_category_specs(self) -> Dict[str, Dict[str, Any]]:
+        """Category specifications"""
+        return {
+            'Action Recognition': {'methods': ['kmeans', 'agglomerative'], 'frames': [8, 10, 12], 'temporal': True},
+            'Action Reasoning': {'methods': ['spectral', 'agglomerative'], 'frames': [10, 12, 15], 'temporal': True},
+            'Attribute Perception': {'methods': ['kmeans', 'dbscan'], 'frames': [6, 8, 10], 'spatial': True},
+            'Counting Problem': {'methods': ['dbscan', 'kmeans'], 'frames': [8, 10, 12], 'detail': True},
+            'OCR Problems': {'methods': ['dbscan', 'spectral'], 'frames': [6, 8, 10], 'text': True},
+            'Object Recognition': {'methods': ['kmeans', 'agglomerative'], 'frames': [6, 8, 10], 'object': True},
+            'Spatial Perception': {'methods': ['spectral', 'agglomerative'], 'frames': [8, 10, 12], 'spatial': True},
+            'Spatial Reasoning': {'methods': ['spectral', 'agglomerative'], 'frames': [10, 12, 15], 'spatial': True, 'reasoning': True},
+            'Temporal Perception': {'methods': ['kmeans', 'agglomerative'], 'frames': [10, 12, 15], 'temporal': True},
+            'Temporal Reasoning': {'methods': ['agglomerative', 'spectral'], 'frames': [12, 15, 18], 'temporal': True, 'reasoning': True}
+        }
+    
+    @lru_cache(maxsize=100)
+    def generate_param_combinations(self, category: str, method: str, max_combinations: int = 15) -> Tuple[Dict, ...]:
+        """Cached generation of VALID parameter combinations"""
+        if method not in self.param_space:
+            return tuple()
+        
+        spec = self.category_specs.get(category, {'methods': ['kmeans'], 'frames': [8]})
+        base_params = self.param_space[method].copy()
+        
+        # Adapt to category
+        if 'frames' in spec:
+            base_params['max_frames'] = spec['frames']
+        
+        if spec.get('temporal'):
+            base_params['frame_interval'] = [16, 20, 24]
+        elif spec.get('detail') or spec.get('text'):
+            base_params['frame_interval'] = [8, 12, 16]
+        
+        # Generate combinations with validation
+        import itertools
+        param_names = list(base_params.keys())
+        param_values = list(base_params.values())
+        
+        valid_combinations = []
+        for combo in itertools.product(*param_values):
+            param_dict = dict(zip(param_names, combo))
+            param_dict['method'] = method
+            
+            # Validation for agglomerative parameters
+            if method == 'agglomerative':
+                linkage = param_dict.get('agglomerative_linkage', 'ward')
+                affinity = param_dict.get('agglomerative_affinity', 'euclidean')
+                
+                # Ward linkage only works with euclidean distance
+                if linkage == 'ward' and affinity != 'euclidean':
+                    continue
+                
+                # Cosine affinity doesn't work with ward
+                if affinity == 'cosine' and linkage == 'ward':
+                    continue
+            
+            valid_combinations.append(param_dict)
+            
+            if len(valid_combinations) >= max_combinations:
+                break
+        
+        logging.info(f"Generated {len(valid_combinations)} valid combinations for {method}")
+        return tuple(valid_combinations)
+    
+    def evaluate_clustering_quality_fast(self, embeddings: np.ndarray, labels: np.ndarray) -> float:
+        """Fast clustering quality evaluation"""
+        try:
+            n_clusters = len(np.unique(labels))
+            
+            if n_clusters < 2 or n_clusters >= len(embeddings):
+                return -1.0
+            
+            # Handle DBSCAN noise points
+            if -1 in labels:
+                mask = labels != -1
+                if np.sum(mask) < 4:
+                    return -1.0
+                embeddings = embeddings[mask]
+                labels = labels[mask]
+                n_clusters = len(np.unique(labels))
+                if n_clusters < 2:
+                    return -1.0
+            
+            # Use only silhouette for speed
+            return silhouette_score(embeddings, labels)
+            
+        except Exception:
+            return -1.0
+    
+    def perform_clustering_optimized(self, embeddings: np.ndarray, config: ClusteringConfig) -> Tuple[np.ndarray, int]:
+        """Optimized clustering with parameter validation"""
+        try:
+            method = config.method
+            params = config.params  # Now this is a property
+            
+            if method == "kmeans":
+                best_k = self._find_optimal_k_fast(embeddings, config)
+                clusterer = KMeans(n_clusters=best_k, random_state=42, **params)
+                labels = clusterer.fit_predict(embeddings)
+                return labels, best_k
+                
+            elif method == "dbscan":
+                eps = params.get('eps', 0.3)
+                min_samples = params.get('min_samples', 2)
+                clusterer = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine')
+                labels = clusterer.fit_predict(embeddings)
+                n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+                return labels, n_clusters
+                
+            elif method == "agglomerative":
+                best_k = self._find_optimal_k_fast(embeddings, config)
+                linkage = params.get('linkage', 'average')
+                affinity = params.get('affinity', 'euclidean')
+                
+                # Additional validation just in case
+                if linkage == 'ward' and affinity != 'euclidean':
+                    affinity = 'euclidean'
+                elif affinity == 'cosine' and linkage == 'ward':
+                    linkage = 'average'
+                
+                if affinity == "cosine":
+                    # For cosine use precomputed distances
+                    distance_matrix = cosine_distances(embeddings)
+                    clusterer = AgglomerativeClustering(
+                        n_clusters=best_k,
+                        linkage=linkage,
+                        metric='precomputed'
+                    )
+                    labels = clusterer.fit_predict(distance_matrix)
+                else:
+                    # For euclidean use normal mode
+                    clusterer = AgglomerativeClustering(
+                        n_clusters=best_k,
+                        linkage=linkage,
+                        metric=affinity
+                    )
+                    labels = clusterer.fit_predict(embeddings)
+                
+                return labels, best_k
+                
+            elif method == "spectral":
+                best_k = self._find_optimal_k_fast(embeddings, config)
+                affinity = params.get('affinity', 'rbf')
+                gamma = params.get('gamma', 1.0)
+                
+                clusterer = SpectralClustering(
+                    n_clusters=best_k,
+                    affinity=affinity,
+                    gamma=gamma,
+                    random_state=42
+                )
+                labels = clusterer.fit_predict(embeddings)
+                return labels, best_k
+            
+            else:
+                logging.warning(f"Unknown method {method}, using KMeans")
+                raise ValueError(f"Unknown method: {method}")
+                
+        except Exception as e:
+            logging.warning(f"Clustering error {method}: {e}")
+            # Reliable fallback
+            try:
+                best_k = min(3, len(embeddings) - 1)
+                clusterer = KMeans(n_clusters=best_k, random_state=42, n_init=5)
+                labels = clusterer.fit_predict(embeddings)
+                return labels, best_k
+            except Exception as fallback_error:
+                logging.error(f"Critical clustering error: {fallback_error}")
+                # Last fallback - no clustering
+                return np.zeros(len(embeddings), dtype=int), 1
+    
+    def _find_optimal_k_fast(self, embeddings: np.ndarray, config: ClusteringConfig) -> int:
+        """Fast optimal k search"""
+        max_k = min(config.max_clusters, len(embeddings) - 1, 8)  # Limit for speed
+        min_k = min(config.min_clusters, max_k)
+        
+        if max_k <= min_k:
+            return min_k
+        
+        best_score = -1
+        best_k = min_k
+        
+        # Test only a few k values
+        k_values = list(range(min_k, min(max_k + 1, min_k + 4)))
+        
+        for k in k_values:
+            try:
+                if config.method == "kmeans":
+                    kmeans = KMeans(n_clusters=k, random_state=42, n_init=5)  # Fewer initializations
+                    labels = kmeans.fit_predict(embeddings)
+                else:
+                    # For other methods use agglomerative as fast substitute
+                    clusterer = AgglomerativeClustering(n_clusters=k)
+                    labels = clusterer.fit_predict(embeddings)
+                
+                score = self.evaluate_clustering_quality_fast(embeddings, labels)
+                
+                if score > best_score:
+                    best_score = score
+                    best_k = k
+                    
+            except Exception:
+                continue
+        
+        return best_k
+    
+    def tune_category_hyperparams_optimized(self, category: str, embeddings_samples: List[np.ndarray], 
+                                          max_combinations: int = 12) -> ClusteringConfig:
+        """Fast optimized hyperparameter tuning"""
+        logging.info(f"Fast tuning for {category}")
+        
+        spec = self.category_specs.get(category, {'methods': ['kmeans']})
+        preferred_methods = spec.get('methods', ['kmeans'])
+        
+        best_config = None
+        best_score = -1
+        total_tests = 0
+        
+        with memory_cleanup():
+            for method in preferred_methods:
+                logging.info(f"{method} for {category}")
+                
+                param_combinations = self.generate_param_combinations(category, method, max_combinations)
+                
+                if not param_combinations:
+                    logging.warning(f"No valid combinations for {method}")
+                    continue
+                
+                # Batch processing with early stopping
+                best_method_score = -1
+                no_improvement_count = 0
+                max_no_improvement = 5
+                
+                for i, params in enumerate(param_combinations):
+                    if no_improvement_count >= max_no_improvement:
+                        logging.info(f"Early stopping for {method} after {i} tests")
+                        break
+                    
+                    try:
+                        config = ClusteringConfig(**params)
+                        scores = []
+                        
+                        # Fast testing on subset
+                        sample_size = min(len(embeddings_samples), 2)  # Even fewer samples
+                        for embeddings in embeddings_samples[:sample_size]:
+                            if len(embeddings) < 4:
+                                continue
+                            
+                            labels, _ = self.perform_clustering_optimized(embeddings, config)
+                            score = self.evaluate_clustering_quality_fast(embeddings, labels)
+                            
+                            if score > 0:
+                                scores.append(score)
+                        
+                        if scores:
+                            avg_score = np.mean(scores)
+                            total_tests += 1
+                            
+                            if avg_score > best_method_score:
+                                best_method_score = avg_score
+                                no_improvement_count = 0
+                                
+                                if avg_score > best_score:
+                                    best_score = avg_score
+                                    best_config = config
+                                    logging.info(f"New best: {avg_score:.3f} ({method})")
+                            else:
+                                no_improvement_count += 1
+                    
+                    except Exception as e:
+                        logging.warning(f"Testing error {method}: {e}")
+                        no_improvement_count += 1
+                        continue
+                    
+                    # Memory check
+                    if MemoryMonitor.check_memory_limit(self.config.max_memory_usage):
+                        MemoryMonitor.force_gc()
+        
+        if best_config:
+            self.category_configs[category] = best_config
+            logging.info(f"{category}: {best_config.method} (score: {best_score:.3f}, tests: {total_tests})")
+        else:
+            # Create default configuration
+            default_method = preferred_methods[0] if preferred_methods else 'kmeans'
+            default_params = self._get_safe_default_params(default_method, category)
+            self.category_configs[category] = ClusteringConfig(**default_params)
+            logging.warning(f"{category}: using safe default configuration ({default_method})")
+        
+        return self.category_configs[category]
+    
+    def _get_safe_default_params(self, method: str, category: str) -> Dict[str, Any]:
+        """Get safe default parameters"""
+        spec = self.category_specs.get(category, {})
+        
+        base_params = {
+            'method': method,
+            'max_frames': 8,
+            'frame_interval': 16,
+            'min_clusters': 2,
+            'max_clusters': 4,
+            'primary_metric': 'silhouette'
+        }
+        
+        # Adapt to category
+        if spec.get('temporal'):
+            base_params['frame_interval'] = 20
+            base_params['max_frames'] = 10
+        elif spec.get('detail') or spec.get('text'):
+            base_params['frame_interval'] = 12
+            base_params['max_frames'] = 6
+        
+        # Safe parameters for each method
+        if method == 'kmeans':
+            base_params.update({
+                'kmeans_init': 'k-means++',
+                'kmeans_n_init': 10
+            })
+        elif method == 'dbscan':
+            base_params.update({
+                'dbscan_eps': 0.3,
+                'dbscan_min_samples': 2
+            })
+        elif method == 'agglomerative':
+            # Always safe combination
+            base_params.update({
+                'agglomerative_linkage': 'average',
+                'agglomerative_affinity': 'euclidean'
+            })
+        elif method == 'spectral':
+            base_params.update({
+                'spectral_affinity': 'rbf',
+                'spectral_gamma': 1.0
+            })
+        
+        return base_params
+    
+    def save_category_configs(self, filepath: str = "category_configs.json"):
+        """Save configurations"""
+        configs_dict = {category: asdict(config) for category, config in self.category_configs.items()}
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump({
+                'category_configs': configs_dict,
+                'created_at': datetime.now().isoformat()
+            }, f, ensure_ascii=False, indent=2)
+        
+        logging.info(f"Configurations saved to {filepath}")
+    
+    def load_category_configs(self, filepath: str = "category_configs.json"):
+        """Load configurations"""
+        try:
+            if not os.path.exists(filepath):
+                return
+            
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            configs_dict = data.get('category_configs', {})
+            for category, config_dict in configs_dict.items():
+                self.category_configs[category] = ClusteringConfig(**config_dict)
+            
+            logging.info(f"Loaded configurations for {len(self.category_configs)} categories")
+            
+        except Exception as e:
+            logging.warning(f"Error loading configurations: {e}")
+
+class OptimizedFrameSelector:
+    """Optimized frame selector"""
+    
+    def __init__(self, bucket_name: str = "videoresearch", config: SystemConfig = None):
+        self.config = config or SystemConfig()
+        self.bucket_name = bucket_name
+        
+        # Caches
+        self.embedding_cache = EmbeddingCache(self.config.cache_size)
+        self.question_cache = {}
+        
+        # Components
+        self.hyperparams_tuner = OptimizedHyperparameterTuner(self.config)
+        
+        # Categories and constants
+        self.categories = [
+            'Action Recognition', 'Action Reasoning', 'Attribute Perception',
+            'Counting Problem', 'OCR Problems', 'Object Recognition',
+            'Spatial Perception', 'Spatial Reasoning', 'Temporal Perception',
+            'Temporal Reasoning'
+        ]
+        self.answer_choices = ['A', 'B', 'C', 'D', 'E']
+        
+        # Statistics
+        self._init_stats()
+        
+        self._setup_system()
+    
+    def _init_stats(self):
+        """Initialize statistics"""
+        self.stats = {
+            'start_time': datetime.now(),
+            'videos_attempted': 0,
+            'videos_downloaded': 0,
+            'videos_processed': 0,
+            'correct_answers': 0,
+            'download_errors': 0,
+            'processing_errors': 0,
+            'by_category': defaultdict(lambda: {
+                'attempted': 0, 'downloaded': 0, 'processed': 0,
+                'correct': 0, 'download_errors': 0, 'processing_errors': 0
+            }),
+            'hyperparams_used': defaultdict(lambda: defaultdict(int)),
+            'failed_downloads': [],
+            'memory_peaks': [],
+            'processing_times': []
+        }
+    
+    def _setup_system(self):
+        """Fast system setup"""
+        logging.info("Optimized initialization...")
+        
+        self._setup_device()
+        self._setup_cloud_storage()
+        self._load_clip_model_optimized()
+        self._setup_ytdlp()
+        self._create_directories()
+        self._load_dataset()
+        self._scan_available_videos()
+        
+        logging.info("System ready")
+    
+    def _setup_device(self):
+        """Device setup with optimization"""
+        torch.set_default_dtype(torch.float32)
+        
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+            logging.info("Using Apple Silicon GPU (MPS)")
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+            # CUDA optimization
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.enabled = True
+            logging.info(f"Using NVIDIA GPU: {torch.cuda.get_device_name()}")
+        else:
+            self.device = "cpu"
+            logging.info("Using CPU")
+    
+    def _setup_cloud_storage(self):
+        """Cloud storage setup"""
+        access_key = os.getenv('YANDEX_ACCESS_KEY') or "key"
+        secret_key = os.getenv('YANDEX_SECRET_KEY') or "key"
+        
+        self.s3_client = boto3.client(
+            's3',
+            endpoint_url='https://storage.yandexcloud.net',
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key
+        )
+        
+        logging.info("Cloud storage connected")
+    
+    def _load_clip_model_optimized(self):
+        """Optimized CLIP loading"""
+        logging.info("Loading optimized CLIP model...")
+        
+        with memory_cleanup():
+            self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+            self.clip_model = self.clip_model.float()
+            self.clip_model.eval()
+            
+            # Optimization for inference
+            if hasattr(torch, 'jit') and self.device != "mps":  # MPS doesn't support JIT yet
+                try:
+                    dummy_input = torch.randn(1, 3, 224, 224).to(self.device)
+                    self.clip_model = torch.jit.trace(self.clip_model.encode_image, dummy_input)
+                    logging.info("CLIP model optimized with JIT")
+                except Exception as e:
+                    logging.warning(f"JIT optimization failed: {e}")
+        
+        logging.info("CLIP model ready")
+    
+    def _setup_ytdlp(self):
+        """yt-dlp setup with optimization"""
+        self.ydl_opts = {
+            'format': 'best[height<=720]/best',
+            'outtmpl': '%(id)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'writeinfojson': False,  # No additional info needed
+            'writethumbnail': False,
+            'writesubtitles': False,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+            }
+        }
+    
+    def _create_directories(self):
+        """Create directories"""
+        directories = ['temp_videos', 'temp_frames', 'optimized_results', 
+                      'selected_frames_optimized', 'logs', 'cache']
+        for directory in directories:
+            Path(directory).mkdir(exist_ok=True)
+    
+    def _load_dataset(self):
+        """Optimized dataset loading with size limit"""
+        logging.info("Loading dataset...")
+        
+        # Cache dataset
+        cache_file = Path('cache/dataset_index.json')
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r') as f:
+                    self.dataset_index = json.load(f)
+                logging.info(f"Loaded cached index: {len(self.dataset_index)} records")
+                return
+            except Exception as e:
+                logging.warning(f"Cache loading error: {e}")
+        
+        # Load anew with limit
+        logging.info("Loading and filtering dataset...")
+        self.dataset = load_dataset("facebook/PLM-Video-Auto", "yt1b_mcqa", split="train")
+        self.dataset_index = {}
+        
+        # Limit number of records per category for stability
+        category_counts = defaultdict(int)
+        max_per_category = 1000  # Limit to prevent memory overflow
+        
+        for sample in tqdm(self.dataset, desc="Filtering dataset"):
+            if sample['category'] in self.categories:
+                if category_counts[sample['category']] < max_per_category:
+                    key = f"{sample['video_id']}_{sample['category']}"
+                    self.dataset_index[key] = sample
+                    category_counts[sample['category']] += 1
+        
+        # Save to cache
+        with open(cache_file, 'w') as f:
+            json.dump(self.dataset_index, f)
+        
+        logging.info(f"Created limited index: {len(self.dataset_index)} records")
+        for category, count in category_counts.items():
+            logging.info(f"  {category}: {count} records")
+    
+    def _scan_available_videos(self):
+        """Safe video scanning (without ThreadPoolExecutor for MPS compatibility)"""
+        logging.info("Scanning available videos...")
+        
+        self.available_videos = defaultdict(list)
+        
+        # Sequential scanning to avoid segfault on Apple Silicon
+        for category in self.categories:
+            try:
+                logging.info(f"Scanning {category}...")
+                videos = self._scan_category(category)
+                self.available_videos[category] = videos
+                logging.info(f"{category}: {len(videos)} videos")
+                
+                # Small pause for stability
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logging.warning(f"Error scanning {category}: {e}")
+                self.available_videos[category] = []
+        
+        total_videos = sum(len(videos) for videos in self.available_videos.values())
+        logging.info(f"Total available {total_videos} videos")
+    
+    def _scan_category(self, category: str) -> List[str]:
+        """Scan one category"""
+        videos = []
+        try:
+            prefix = f"frames/{category}/"
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            
+            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix, Delimiter='/'):
+                if 'CommonPrefixes' in page:
+                    for obj in page['CommonPrefixes']:
+                        video_id = obj['Prefix'].split('/')[-2]
+                        key = f"{video_id}_{category}"
+                        if key in self.dataset_index:
+                            videos.append(video_id)
+        except Exception as e:
+            logging.warning(f"Error scanning {category}: {e}")
+        
+        return videos
+    
+    @lru_cache(maxsize=100)
+    def get_question_embedding_cached(self, question_text: str) -> Optional[np.ndarray]:
+        """Cached question embedding retrieval"""
+        cache_key = self.embedding_cache._get_key(question_text)
+        
+        cached = self.embedding_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        
+        try:
+            # Clean text
+            clean_question = re.sub(r'[A-E]\)\s*', '', question_text)
+            clean_question = re.sub(r'\n+', ' ', clean_question).strip()
+            
+            with torch.no_grad():
+                text_tokens = clip.tokenize([clean_question], truncate=True).to(self.device)
+                text_features = self.clip_model.encode_text(text_tokens)
+                text_embedding = text_features.float().cpu().numpy().flatten()
+            
+            self.embedding_cache.put(cache_key, text_embedding)
+            return text_embedding
+            
+        except Exception as e:
+            logging.error(f"Error getting embedding: {e}")
+            return None
+    
+    @retry_with_backoff(max_retries=3, delay=1.0)
+    def download_video_optimized(self, video_id: str, category: str) -> str:
+        """Optimized video download"""
+        self.stats['videos_attempted'] += 1
+        self.stats['by_category'][category]['attempted'] += 1
+        
+        try:
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            logging.info(f"Downloading: {video_id}")
+            
+            temp_dir = Path('temp_videos')
+            ydl_opts = self.ydl_opts.copy()
+            ydl_opts['outtmpl'] = str(temp_dir / f"{video_id}.%(ext)s")
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                if not info:
+                    raise Exception("No video info")
+            
+            # Search for file
+            for ext in ['mp4', 'webm', 'mkv', 'avi', 'mov']:
+                potential_file = temp_dir / f"{video_id}.{ext}"
+                if potential_file.exists() and potential_file.stat().st_size > 1000:
+                    self.stats['videos_downloaded'] += 1
+                    self.stats['by_category'][category]['downloaded'] += 1
+                    return str(potential_file)
+            
+            raise Exception("File not found or corrupted")
+            
+        except Exception as e:
+            error_msg = str(e)
+            logging.error(f"Download error {video_id}: {error_msg}")
+            
+            self.stats['download_errors'] += 1
+            self.stats['by_category'][category]['download_errors'] += 1
+            self.stats['failed_downloads'].append({
+                'video_id': video_id,
+                'category': category,
+                'error': error_msg,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            raise
+    
+    def extract_frames_optimized(self, video_path: str, video_id: str, frame_interval: int = 16) -> List[Dict]:
+        """Optimized frame extraction"""
+        frames_dir = Path('temp_frames') / video_id
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise Exception("Cannot open video")
+            
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            extracted_frames = []
+            frame_number = 0
+            saved_count = 0
+            
+            # Batch frame processing
+            batch_frames = []
+            batch_paths = []
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if frame_number % frame_interval == 0:
+                    timestamp = frame_number / fps if fps > 0 else frame_number / 30
+                    
+                    frame_filename = f"frame_{saved_count:04d}.jpg"
+                    frame_path = frames_dir / frame_filename
+                    
+                    # Image optimization
+                    pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    if pil_image.width > self.config.max_image_size or pil_image.height > self.config.max_image_size:
+                        pil_image.thumbnail((self.config.max_image_size, self.config.max_image_size), Image.Resampling.LANCZOS)
+                    
+                    pil_image.save(frame_path, 'JPEG', quality=self.config.jpeg_quality, optimize=True)
+                    
+                    batch_frames.append(pil_image)
+                    batch_paths.append(frame_path)
+                    
+                    extracted_frames.append({
+                        'index': saved_count,
+                        'frame_number': frame_number,
+                        'timestamp': timestamp,
+                        'filename': frame_filename,
+                        'path': str(frame_path)
+                    })
+                    
+                    saved_count += 1
+                    
+                    # Process embedding batch
+                    if len(batch_frames) >= self.config.batch_size:
+                        self._process_frame_batch(batch_frames, extracted_frames[-len(batch_frames):])
+                        batch_frames = []
+                        batch_paths = []
+                
+                frame_number += 1
+            
+            # Process remaining frames
+            if batch_frames:
+                self._process_frame_batch(batch_frames, extracted_frames[-len(batch_frames):])
+            
+            cap.release()
+            logging.info(f"Extracted {len(extracted_frames)} frames with interval {frame_interval}")
+            
+            return extracted_frames
+            
+        except Exception as e:
+            logging.error(f"Frame extraction error: {e}")
+            raise
+    
+    def _process_frame_batch(self, batch_frames: List[Image.Image], frame_infos: List[Dict]):
+        """Safe batch embedding processing for Apple Silicon"""
+        try:
+            # For MPS use smaller batches
+            if self.device == "mps" and len(batch_frames) > 2:
+                # Split into smaller batches for MPS stability
+                mid = len(batch_frames) // 2
+                self._process_frame_batch(batch_frames[:mid], frame_infos[:mid])
+                self._process_frame_batch(batch_frames[mid:], frame_infos[mid:])
+                return
+            
+            batch_tensors = []
+            for pil_image in batch_frames:
+                tensor = self.clip_preprocess(pil_image).unsqueeze(0)
+                batch_tensors.append(tensor)
+            
+            if batch_tensors:
+                batch_input = torch.cat(batch_tensors, dim=0).to(self.device)
+                
+                with torch.no_grad():
+                    clip_features = self.clip_model.encode_image(batch_input)
+                    clip_embeddings = clip_features.float().cpu().numpy()
+                
+                # Assign embeddings to frames
+                for i, frame_info in enumerate(frame_infos):
+                    if i < len(clip_embeddings):
+                        frame_info['embedding'] = clip_embeddings[i]
+                        
+                        # Cache embedding
+                        cache_key = self.embedding_cache._get_key(frame_info['path'])
+                        self.embedding_cache.put(cache_key, clip_embeddings[i])
+                
+                # Force cleanup for MPS
+                if self.device == "mps":
+                    del batch_input, clip_features, clip_embeddings
+                    torch.mps.empty_cache()
+        
+        except Exception as e:
+            logging.warning(f"Batch processing error: {e}")
+            # Fallback to individual processing
+            for pil_image, frame_info in zip(batch_frames, frame_infos):
+                try:
+                    with torch.no_grad():
+                        image_input = self.clip_preprocess(pil_image).unsqueeze(0).to(self.device)
+                        clip_features = self.clip_model.encode_image(image_input)
+                        frame_info['embedding'] = clip_features.float().cpu().numpy().flatten()
+                        
+                        # Cleanup for MPS
+                        if self.device == "mps":
+                            del image_input, clip_features
+                            torch.mps.empty_cache()
+                            
+                except Exception:
+                    frame_info['embedding'] = np.zeros(512)  # Fallback embedding
+    
+    def adaptive_frame_selection_optimized(self, frames: List[Dict], question_embedding: np.ndarray, 
+                                         category: str, video_id: str) -> List[Dict]:
+        """Optimized adaptive frame selection"""
+        config = self.hyperparams_tuner.category_configs.get(category, ClusteringConfig())
+        max_frames = config.max_frames
+        
+        logging.info(f"Selecting from {len(frames)} frames (method: {config.method}, max: {max_frames})")
+        
+        if len(frames) <= max_frames:
+            for i, frame in enumerate(frames):
+                frame.update({'selection_order': i, 'cluster_id': 0, 'distance_to_question': 0.0, 'method_used': config.method})
+            return frames
+        
+        try:
+            with memory_cleanup():
+                frame_embeddings = np.array([frame['embedding'] for frame in frames])
+                
+                # Fast clustering
+                labels, n_clusters = self.hyperparams_tuner.perform_clustering_optimized(frame_embeddings, config)
+                
+                # Group by clusters
+                clusters = defaultdict(list)
+                for i, label in enumerate(labels):
+                    if label != -1:
+                        clusters[label].append(frames[i])
+                
+                if not clusters:
+                    return self._uniform_frame_selection(frames, max_frames, config.method)
+                
+                # Frame distribution
+                frames_per_cluster = max_frames // len(clusters)
+                remaining_frames = max_frames % len(clusters)
+                
+                selected_frames = []
+                
+                for cluster_id, cluster_frames in clusters.items():
+                    cluster_embeddings = np.array([frame['embedding'] for frame in cluster_frames])
+                    distances = cosine_distances([question_embedding], cluster_embeddings)[0]
+                    
+                    num_frames = frames_per_cluster + (1 if remaining_frames > 0 else 0)
+                    if remaining_frames > 0:
+                        remaining_frames -= 1
+                    
+                    closest_indices = np.argsort(distances)[:num_frames]
+                    
+                    for idx in closest_indices:
+                        frame = cluster_frames[idx]
+                        frame.update({
+                            'cluster_id': int(cluster_id),
+                            'distance_to_question': float(distances[idx]),
+                            'method_used': config.method
+                        })
+                        selected_frames.append(frame)
+                
+                # Sort by time and assign order
+                selected_frames.sort(key=lambda x: x['timestamp'])
+                for i, frame in enumerate(selected_frames):
+                    frame['selection_order'] = i
+                
+                self.stats['hyperparams_used'][category][config.method] += 1
+                
+                logging.info(f"Selected {len(selected_frames)} frames using {config.method}")
+                return selected_frames
+                
+        except Exception as e:
+            logging.error(f"Adaptive selection error: {e}")
+            return self._uniform_frame_selection(frames, max_frames, "fallback")
+    
+    def _uniform_frame_selection(self, frames: List[Dict], max_frames: int, method: str) -> List[Dict]:
+        """Uniform frame selection (fallback)"""
+        step = max(1, len(frames) // max_frames)
+        selected = frames[::step][:max_frames]
+        
+        for i, frame in enumerate(selected):
+            frame.update({'selection_order': i, 'cluster_id': 0, 'distance_to_question': 0.0, 'method_used': method})
+        
+        return selected
+    
+    @retry_with_backoff(max_retries=3, delay=2.0)
+    def send_qwen_request_optimized(self, question: str, selected_frames: List[Dict]) -> Optional[Dict]:
+        """Optimized API request"""
+        models_to_try = [self.config.primary_model] + self.config.backup_models
+        
+        for model_name in models_to_try:
+            try:
+                logging.info(f"API request to {model_name} with {len(selected_frames)} frames")
+                
+                content = [{
+                    "type": "text",
+                    "text": f"""Answer this multiple choice question about the video:
+
+{question}
+
+Respond with ONLY the letter (A, B, C, D, or E)."""
+                }]
+                
+                # Optimized image loading
+                for i, frame in enumerate(selected_frames):
+                    try:
+                        with open(frame['path'], 'rb') as f:
+                            import base64
+                            image_data = base64.b64encode(f.read()).decode('utf-8')
+                        
+                        content.extend([
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
+                            {"type": "text", "text": f"Frame {i+1}: {frame['timestamp']:.1f}s"}
+                        ])
+                    except Exception as e:
+                        logging.warning(f"Frame loading error: {e}")
+                        continue
+                
+                payload = {
+                    "model": model_name,
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                    "logprobs": True,
+                    "top_logprobs": 5,
+                    "messages": [{"role": "user", "content": content}]
+                }
+                
+                headers = {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.config.api_key}"
+                }
+                
+                response = requests.post(self.config.api_url, headers=headers, json=payload, timeout=180)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if 'choices' in result and result['choices']:
+                        choice = result['choices'][0]
+                        return {
+                            'response_text': choice['message']['content'],
+                            'logprobs': choice.get('logprobs', {}),
+                            'model_used': model_name
+                        }
+                else:
+                    logging.warning(f"API error {response.status_code}: {response.text}")
+                    continue
+                    
+            except Exception as e:
+                logging.warning(f"Request error to {model_name}: {e}")
+                continue
+        
+        return None
+    
+    def extract_answer_optimized(self, result: Dict) -> Optional[str]:
+        """Optimized answer extraction"""
+        if not result:
+            return None
+        
+        # Priority: logprobs -> response_text
+        logprobs_data = result.get('logprobs', {})
+        
+        if 'content' in logprobs_data and logprobs_data['content']:
+            content = logprobs_data['content'][0]
+            
+            if 'top_logprobs' in content:
+                answer_probs = {}
+                for token_info in content['top_logprobs']:
+                    token = token_info['token'].strip().upper()
+                    if token in self.answer_choices:
+                        answer_probs[token] = token_info['logprob']
+                
+                if answer_probs:
+                    return max(answer_probs.items(), key=lambda x: x[1])[0]
+        
+        # Fallback to text
+        response_text = result.get('response_text', '')
+        for pattern in [r'^([A-E])$', r'([A-E])']:
+            match = re.search(pattern, response_text.strip().upper())
+            if match:
+                return match.group(1)
+        
+        return None
+    
+    def process_single_video_optimized(self, video_id: str, category: str) -> Dict:
+        """Optimized single video processing"""
+        start_time = time.time()
+        video_path = None
+        
+        try:
+            logging.info(f"Processing {video_id} ({category})")
+            
+            # Get question
+            key = f"{video_id}_{category}"
+            if key not in self.dataset_index:
+                raise Exception("Question not found")
+            
+            sample = self.dataset_index[key]
+            conversations = sample['conversations']
+            
+            if not conversations or len(conversations) < 2:
+                raise Exception("Incorrect format")
+            
+            question = conversations[0]['value']
+            true_answer = conversations[1]['value']
+            
+            # Extract correct answer
+            true_letter = self.extract_answer_optimized({'response_text': true_answer})
+            if not true_letter:
+                raise Exception("Cannot extract correct answer")
+            
+            # Get question embedding (cached)
+            question_embedding = self.get_question_embedding_cached(question)
+            if question_embedding is None:
+                raise Exception("Cannot get question embedding")
+            
+            # Download video
+            try:
+                video_path = self.download_video_optimized(video_id, category)
+            except Exception as e:
+                return {
+                    'video_id': video_id, 'category': category,
+                    'download_error': str(e), 'is_correct': False, 'processed': False
+                }
+            
+            # Extract frames
+            config = self.hyperparams_tuner.category_configs.get(category, ClusteringConfig())
+            all_frames = self.extract_frames_optimized(video_path, video_id, config.frame_interval)
+            
+            if not all_frames:
+                raise Exception("Cannot extract frames")
+            
+            # Adaptive selection
+            selected_frames = self.adaptive_frame_selection_optimized(
+                all_frames, question_embedding, category, video_id
+            )
+            
+            if not selected_frames:
+                raise Exception("Cannot select frames")
+            
+            # Send to model
+            result = self.send_qwen_request_optimized(question, selected_frames)
+            if not result:
+                raise Exception("No response from model")
+            
+            # Extract answer
+            predicted_letter = self.extract_answer_optimized(result)
+            if not predicted_letter:
+                raise Exception("Cannot extract answer")
+            
+            # Result
+            is_correct = predicted_letter == true_letter
+            processing_time = time.time() - start_time
+            
+            # Update statistics
+            self.stats['videos_processed'] += 1
+            self.stats['by_category'][category]['processed'] += 1
+            self.stats['processing_times'].append(processing_time)
+            
+            if is_correct:
+                self.stats['correct_answers'] += 1
+                self.stats['by_category'][category]['correct'] += 1
+            
+            method_used = selected_frames[0].get('method_used', 'unknown') if selected_frames else 'unknown'
+            
+            result_dict = {
+                'video_id': video_id,
+                'category': category,
+                'question': question,
+                'true_answer': true_letter,
+                'predicted_answer': predicted_letter,
+                'is_correct': is_correct,
+                'processed': True,
+                'processing_time': processing_time,
+                'clustering_method': method_used,
+                'total_frames': len(all_frames),
+                'selected_frames': len(selected_frames),
+                'hyperparams_config': asdict(config)
+            }
+            
+            logging.info(f"Result: {predicted_letter} vs {true_letter} "
+                        f"({'correct' if is_correct else 'incorrect'}) in {processing_time:.1f}s")
+            
+            return result_dict
+            
+        except Exception as e:
+            error_msg = str(e)
+            processing_time = time.time() - start_time
+            
+            if "download video" not in error_msg:
+                self.stats['processing_errors'] += 1
+                self.stats['by_category'][category]['processing_errors'] += 1
+            
+            logging.error(f"Processing error {video_id}: {error_msg}")
+            
+            return {
+                'video_id': video_id, 'category': category,
+                'processing_error': error_msg, 'is_correct': False, 
+                'processed': False, 'processing_time': processing_time
+            }
+        
+        finally:
+            # Cleanup
+            try:
+                if video_path and os.path.exists(video_path):
+                    os.remove(video_path)
+                
+                temp_frames_dir = Path('temp_frames') / video_id
+                if temp_frames_dir.exists():
+                    import shutil
+                    shutil.rmtree(temp_frames_dir)
+                
+                # Periodic memory cleanup
+                if self.stats['videos_processed'] % self.config.gc_frequency == 0:
+                    MemoryMonitor.force_gc()
+                    memory_usage = MemoryMonitor.get_memory_usage()
+                    self.stats['memory_peaks'].append(memory_usage)
+                    logging.info(f"Memory: {memory_usage:.1f}%")
+                    
+            except Exception as cleanup_error:
+                logging.warning(f"Cleanup error: {cleanup_error}")
+    
+    def run_optimized_evaluation(self, max_videos_per_category: int = None, tune_hyperparams: bool = True):
+        """Optimized full evaluation"""
+        logging.info("OPTIMIZED EVALUATION STARTED")
+        
+        if tune_hyperparams:
+            logging.info("Hyperparameter tuning...")
+            self.tune_hyperparams_for_all_categories_optimized()
+        
+        # Count videos
+        total_videos = sum(
+            min(len(videos), max_videos_per_category or float('inf'))
+            for videos in self.available_videos.values()
+        )
+        
+        logging.info(f"Processing {total_videos} videos with optimization")
+        
+        all_results = []
+        processed_count = 0
+        
+        # Process by categories
+        for category in self.categories:
+            if category not in self.available_videos:
+                continue
+            
+            videos = self.available_videos[category]
+            if max_videos_per_category:
+                videos = videos[:max_videos_per_category]
+            
+            logging.info(f"\n{category}: {len(videos)} videos")
+            
+            # Process videos in category
+            for video_id in tqdm(videos, desc=category):
+                result = self.process_single_video_optimized(video_id, category)
+                all_results.append(result)
+                processed_count += 1
+                
+                # Intermediate statistics
+                if processed_count % 10 == 0:
+                    self._show_intermediate_stats()
+                
+                # Small pause for stability
+                time.sleep(0.5)
+        
+        # Final results
+        self._show_final_optimized_results(all_results)
+        self._save_optimized_results(all_results)
+        
+        return all_results
+    
+    def tune_hyperparams_for_all_categories_optimized(self, samples_per_category: int = None):
+        """Fast optimized hyperparameter tuning for all categories"""
+        if samples_per_category is None:
+            samples_per_category = self.config.max_tuning_samples
+            
+        logging.info(f"Fast hyperparameter tuning ({samples_per_category} samples per category)")
+        
+        categories_processed = 0
+        start_time = time.time()
+        
+        for category in self.categories:
+            if category not in self.available_videos or not self.available_videos[category]:
+                continue
+            
+            category_start = time.time()
+            logging.info(f"{category} ({categories_processed + 1}/{len(self.categories)})")
+            
+            embeddings_samples = []
+            videos_sample = self.available_videos[category][:samples_per_category]
+            
+            for video_id in videos_sample:
+                try:
+                    video_path = self.download_video_optimized(video_id, category)
+                    frames = self.extract_frames_optimized(video_path, video_id)
+                    
+                    if len(frames) >= 4:
+                        embeddings = np.array([frame['embedding'] for frame in frames])
+                        embeddings_samples.append(embeddings)
+                    
+                    # Quick cleanup
+                    os.remove(video_path)
+                    import shutil
+                    temp_dir = Path('temp_frames') / video_id
+                    if temp_dir.exists():
+                        shutil.rmtree(temp_dir)
+                    
+                except Exception as e:
+                    logging.warning(f"Tuning error {video_id}: {e}")
+                    continue
+            
+            if embeddings_samples:
+                # Fast tuning with fewer combinations
+                self.hyperparams_tuner.tune_category_hyperparams_optimized(
+                    category, embeddings_samples, self.config.max_tuning_combinations
+                )
+            else:
+                logging.warning(f"No samples for {category}")
+            
+            categories_processed += 1
+            category_time = time.time() - category_start
+            logging.info(f"{category} completed in {category_time:.1f}s")
+            
+            # Force memory cleanup after each category
+            MemoryMonitor.force_gc()
+        
+        total_time = time.time() - start_time
+        self.hyperparams_tuner.save_category_configs()
+        logging.info(f"Hyperparameter tuning completed in {total_time:.1f}s")
+        
+        # Show results
+        logging.info("FOUND CONFIGURATIONS:")
+        for category, config in self.hyperparams_tuner.category_configs.items():
+            logging.info(f"   {category}: {config.method} (frames: {config.max_frames}, interval: {config.frame_interval})")
+    
+    def _show_intermediate_stats(self):
+        """Intermediate statistics"""
+        processed = self.stats['videos_processed']
+        attempted = self.stats['videos_attempted']
+        downloaded = self.stats['videos_downloaded']
+        
+        if processed > 0:
+            accuracy = self.stats['correct_answers'] / processed * 100
+            avg_time = np.mean(self.stats['processing_times']) if self.stats['processing_times'] else 0
+            download_rate = downloaded / attempted * 100 if attempted > 0 else 0
+            
+            logging.info(f"Intermediate: accuracy {accuracy:.1f}%, "
+                        f"downloaded {download_rate:.1f}%, time {avg_time:.1f}s/video")
+    
+    def _show_final_optimized_results(self, all_results: List[Dict]):
+        """Show optimized final results"""
+        total_time = datetime.now() - self.stats['start_time']
+        processed = self.stats['videos_processed']
+        
+        if processed > 0:
+            accuracy = self.stats['correct_answers'] / processed * 100
+            avg_processing_time = np.mean(self.stats['processing_times'])
+            download_success = self.stats['videos_downloaded'] / self.stats['videos_attempted'] * 100
+            
+            logging.info(f"\nFINAL RESULTS (OPTIMIZED VERSION)")
+            logging.info(f"Total time: {total_time}")
+            logging.info(f"Accuracy: {accuracy:.2f}% ({self.stats['correct_answers']}/{processed})")
+            logging.info(f"Download: {download_success:.1f}%")
+            logging.info(f"Average processing time: {avg_processing_time:.1f}s/video")
+            
+            if self.stats['memory_peaks']:
+                max_memory = max(self.stats['memory_peaks'])
+                logging.info(f"Peak memory usage: {max_memory:.1f}%")
+        
+        # Statistics by category
+        logging.info(f"\nBY CATEGORIES:")
+        for category in self.categories:
+            stats = self.stats['by_category'][category]
+            if stats['processed'] > 0:
+                cat_acc = stats['correct'] / stats['processed'] * 100
+                method = max(self.stats['hyperparams_used'][category].items(), 
+                           key=lambda x: x[1])[0] if self.stats['hyperparams_used'][category] else "unknown"
+                logging.info(f"{category}: {cat_acc:.1f}% ({method})")
+    
+    def _save_optimized_results(self, all_results: List[Dict]):
+        """Save optimized results"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        
+        processed = self.stats['videos_processed']
+        accuracy = (self.stats['correct_answers'] / processed * 100) if processed > 0 else 0
+        
+        results = {
+            'experiment_info': {
+                'method': 'optimized_adaptive_clustering_with_hyperparams',
+                'version': '2.0_optimized',
+                'model': self.config.primary_model,
+                'timestamp': datetime.now().isoformat(),
+                'total_time': str(datetime.now() - self.stats['start_time'])
+            },
+            'performance_stats': {
+                'accuracy': accuracy,
+                'videos_processed': processed,
+                'avg_processing_time': np.mean(self.stats['processing_times']) if self.stats['processing_times'] else 0,
+                'max_memory_usage': max(self.stats['memory_peaks']) if self.stats['memory_peaks'] else 0,
+                'download_success_rate': (self.stats['videos_downloaded'] / self.stats['videos_attempted'] * 100) if self.stats['videos_attempted'] > 0 else 0
+            },
+            'hyperparams_configs': {
+                category: asdict(config) 
+                for category, config in self.hyperparams_tuner.category_configs.items()
+            },
+            'detailed_stats': {
+                'by_category': dict(self.stats['by_category']),
+                'hyperparams_usage': dict(self.stats['hyperparams_used']),
+                'failed_downloads': self.stats['failed_downloads']
+            },
+            'all_results': all_results
+        }
+        
+        # Save
+        results_file = Path('optimized_results') / f"optimized_evaluation_{timestamp}.json"
+        with open(results_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        
+        logging.info(f"Results saved: {results_file}")
+
+# ==================== SETUP & MAIN ====================
+
+def setup_optimized_logging():
+    """Setup optimized logging"""
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    Path('logs').mkdir(exist_ok=True)
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = f"logs/optimized_evaluation_{timestamp}.log"
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+def main():
+    """Protected main function for Apple Silicon"""
+    logger = setup_optimized_logging()
+    
+    print("OPTIMIZED ADAPTIVE CLUSTERING V2.2")
+    print("=" * 55)
+    print("Apple Silicon Compatible:")
+    print("   • Multithreading disabled")
+    print("   • Limited dataset size")
+    print("   • Segmentation fault protection")
+    print("   • MPS memory optimization")
+    
+    selector = None
+    
+    try:
+        # System check
+        if torch.backends.mps.is_available():
+            print("Apple Silicon MPS available")
+        
+        # Configuration with segfault protection
+        config = SystemConfig()
+        print(f"\nSAFE SETTINGS:")
+        print(f"Multithreading: {'disabled' if config.disable_threading else 'enabled'}")
+        print(f"Batch size: {config.batch_size}")
+        print(f"Cache: {config.cache_size} records")
+        print(f"Max image size: {config.max_image_size}px")
+        print(f"JPEG quality: {config.jpeg_quality}%")
+        
+        # Initialization with error protection
+        print(f"\nInitializing...")
+        selector = OptimizedFrameSelector(config=config)
+        
+        # Information
+        total_videos = sum(len(videos) for videos in selector.available_videos.values())
+        print(f"\nSTATISTICS:")
+        print(f"Available videos: {total_videos}")
+        print(f"Categories: {len(selector.categories)}")
+        print(f"Loaded configurations: {len(selector.hyperparams_tuner.category_configs)}")
+        
+        # Memory check
+        memory_usage = MemoryMonitor.get_memory_usage()
+        print(f"Memory usage: {memory_usage:.1f}%")
+        
+        if memory_usage > 70:
+            print("High memory usage - restart recommended")
+            confirm = input("Continue? (y/N): ")
+            if confirm.lower() != 'y':
+                return
+        
+        # Run options
+        print(f"\nRUN OPTIONS:")
+        print("1. Full evaluation with fast tuning")
+        print("2. Fast evaluation (existing parameters)")
+        print("3. Mini-test (1 video per category)")
+        print("4. Hyperparameter tuning only")
+        print("5. Single category")
+        
+        choice = input("\nChoice (1-5): ").strip()
+        
+        start_time = time.time()
+        
+        # Force cleanup before start
+        MemoryMonitor.force_gc()
+        
+        if choice == '1':
+            results = selector.run_optimized_evaluation(tune_hyperparams=True)
+        elif choice == '2':
+            results = selector.run_optimized_evaluation(tune_hyperparams=False)
+        elif choice == '3':
+            results = selector.run_optimized_evaluation(max_videos_per_category=1, tune_hyperparams=True)
+        elif choice == '4':
+            selector.tune_hyperparams_for_all_categories_optimized()
+            print("Fast hyperparameter tuning completed!")
+            return
+        elif choice == '5':
+            print("\nCategories:")
+            for i, cat in enumerate(selector.categories, 1):
+                available = len(selector.available_videos.get(cat, []))
+                print(f"{i}. {cat} ({available} videos)")
+            
+            cat_choice = input("Category (1-10): ").strip()
+            try:
+                cat_idx = int(cat_choice) - 1
+                if 0 <= cat_idx < len(selector.categories):
+                    category = selector.categories[cat_idx]
+                    selector.categories = [category]
+                    results = selector.run_optimized_evaluation(tune_hyperparams=True)
+                else:
+                    print("Invalid choice")
+                    return
+            except ValueError:
+                print("Invalid input")
+                return
+        else:
+            print("Invalid choice")
+            return
+        
+        total_time = time.time() - start_time
+        print(f"\nEVALUATION COMPLETED in {total_time:.1f} seconds!")
+        print("Results: optimized_results/")
+        print("Hyperparameters: category_configs.json")
+        
+        # Final statistics
+        if hasattr(selector, 'stats'):
+            processed = selector.stats.get('videos_processed', 0)
+            if processed > 0:
+                accuracy = selector.stats.get('correct_answers', 0) / processed * 100
+                avg_time = total_time / processed
+                print(f"Accuracy: {accuracy:.1f}%")
+                print(f"Average time per video: {avg_time:.1f}s")
+        
+        # Final memory cleanup
+        MemoryMonitor.force_gc()
+        final_memory = MemoryMonitor.get_memory_usage()
+        print(f"Final memory usage: {final_memory:.1f}%")
+        
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    except RuntimeError as e:
+        print(f"\nCritical error: {e}")
+        print("Try:")
+        print("   • Restart terminal")
+        print("   • Free memory")
+        print("   • Use CPU instead of MPS")
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        logger.exception("Critical error")
+        print("Restart recommended")
+    finally:
+        # Force cleanup on any outcome
+        try:
+            if selector:
+                # Cleanup CLIP model
+                if hasattr(selector, 'clip_model'):
+                    del selector.clip_model
+                if hasattr(selector, 'clip_preprocess'):
+                    del selector.clip_preprocess
+            
+            # Cleanup caches
+            torch.mps.empty_cache() if torch.backends.mps.is_available() else None
+            MemoryMonitor.force_gc()
+            
+        except Exception as cleanup_error:
+            logger.warning(f"Final cleanup error: {cleanup_error}")
+        
+        print("\nMemory cleaned")
+
+if __name__ == "__main__":
+    main()
